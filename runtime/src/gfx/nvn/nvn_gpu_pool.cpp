@@ -1018,20 +1018,28 @@ bool copyable(const Mirror& m, uint64_t i, uint32_t now) {
 
 // [nvn] bind_memo (default off until measured; code review RT2): every vertex, index, uniform and storage binding of every draw went through
 // the whole pool and mirror lookup (pool_lookup, the import's chunk, mirror_for's walk over the chunks and spans, the mirror's chunk), ~6%
-// of the render thread, while draws bind the same few ranges over and over. A small per-thread memo keyed by (address, size) keeps the
-// answer of that lookup: the import's BufRef, the mirror and its chunk. It is used only while no pool was registered or removed
-// (pool_gen) and no import, pool or mirror chunk went away or was swapped (g_bind_gen), and never while copy buffers exist (their use has
-// side effects). Whether the pages are valid is still checked on every bind: only the structure is remembered. [nvn] rt_check compares
-// every hit with the full lookup.
+// of the render thread. A small per-thread memo keeps the answer for a 64 KiB region of addresses: the pool's bounds, the import chunk
+// (its buffer and where it starts) and the mirror chunk. Any address in the region whose range stays inside that pool, that import chunk
+// and that mirror chunk gets its buffer and offsets from those by arithmetic; anything else (a span import, a range across chunks) takes
+// the full lookup. Keyed by the exact address, an earlier version hit only half the time: the game's ring buffers rarely bind the same
+// address twice. An entry is used only while no pool was registered or removed (pool_gen) and no import, pool or mirror chunk went away or
+// was swapped (g_bind_gen), and never while copy buffers exist (their use has side effects). Whether the pages are valid is still checked
+// on every bind: only the structure is remembered. [nvn] rt_check compares every hit with the full lookup.
 bool bind_memo_on() {
     static const bool on = config_get_bool("nvn", "bind_memo", false);
     return on;
 }
+constexpr unsigned kBindMemoShift = 16;     // 64 KiB regions
 struct BindMemo {
-    uint64_t addr = 0, size = 0, pool_gen = ~0ull, bind_gen = ~0ull, poff = 0;
-    BufRef out;                   // resolve_in_pool's answer (the import)
+    uint64_t region = ~0ull, pool_gen = ~0ull, bind_gen = ~0ull;
+    uint64_t pool_lo = 0, pool_hi = 0;      // the pool's GPU addresses
+    uint64_t pg_base = 0;                   // the import's aligned base (pool offsets count from it)
+    uint64_t c_lo = 0, c_hi = 0;            // pool offsets whose chunk index is this import chunk's ([k * stride, (k + 1) * stride))
+    uint64_t c_off = 0, c_size = 0, c_boff = 0;
+    VkBuffer c_buf = VK_NULL_HANDLE;
     Mirror* m = nullptr;
-    VkBuffer cb = VK_NULL_HANDLE; // the mirror chunk holding the range
+    uint64_t mci = 0;                       // the mirror chunk index
+    VkBuffer cb = VK_NULL_HANDLE;           // the mirror chunk
 };
 constexpr size_t kBindMemoWays = 256;
 thread_local BindMemo t_bind_memo[kBindMemoWays];
@@ -1079,7 +1087,6 @@ void log_summary(uint32_t now) {
     if (bind_memo_on())
         NXLOG_I(kTag, "bind memo: %lld hits, %lld misses; rt_check %lld checked, %lld mismatches", static_cast<long long>(g_bm_hits),
                 static_cast<long long>(g_bm_misses), static_cast<long long>(g_bm_checks), static_cast<long long>(g_bm_bad));
-    vb_keep_log();
     if (hot_copy_on()) NXLOG_I(kTag, "pool mirror hot copy: %lld pages copied in %lld submissions (over the budget %lld times), %lld binds served from them",
             (long long)g_hotcopy_pages, (long long)g_hotcopy_subs, (long long)g_hotcopy_over, (long long)g_hotcopy_binds);
     std::vector<const Mirror*> top(g_mirrors.begin(), g_mirrors.end());
@@ -1272,7 +1279,24 @@ void storage_probe(uint64_t gpu_address, uint64_t size, bool vertex) {
 }
 
 namespace {
-void bind_memo_check(uint64_t gpu_address, uint64_t size, const BindMemo& e) {
+// The memo's answer for [gpu_address, +size): false when the entry does not cover the range (the caller takes the full lookup).
+bool bind_memo_answer(const BindMemo& e, uint64_t gpu_address, uint64_t size, BufRef* out, uint64_t* poff) {
+    if (gpu_address - e.pool_lo >= e.pool_hi - e.pool_lo) return false;
+    const uint64_t off = gpu_address - e.pg_base;
+    if (off - e.c_lo >= e.c_hi - e.c_lo) return false;                 // another import chunk
+    if (off + size > e.c_off + e.c_size) return false;                 // runs past the chunk: a span holds it
+    const uint64_t chunk_pages = kChunkBytes / kPageBytes;
+    const uint64_t f = off / kPageBytes, l = (off + size - 1) / kPageBytes;
+    if (f / chunk_pages != e.mci || l / chunk_pages != e.mci || l >= e.m->npages) return false;
+    out->buffer = e.c_buf;
+    out->offset = off - e.c_off + e.c_boff;
+    out->avail = e.c_off + e.c_size - off;
+    out->ok = size <= out->avail;
+    *poff = off;
+    return out->ok;
+}
+
+void bind_memo_check(uint64_t gpu_address, uint64_t size, const BindMemo& e, const BufRef& got, uint64_t got_poff) {
     MemoryPool* mp = nullptr;
     PoolGpu* pg = nullptr;
     uint64_t poff = 0;
@@ -1280,7 +1304,7 @@ void bind_memo_check(uint64_t gpu_address, uint64_t size, const BindMemo& e) {
     Mirror* m = pg ? mirror_for(pg, mp) : nullptr;
     const VkBuffer cb = m && poff / kPageBytes < m->npages ? mirror_chunk(*m, poff / kPageBytes) : VK_NULL_HANDLE;
     ++g_bm_checks;
-    if (o.buffer != e.out.buffer || o.offset != e.out.offset || o.avail != e.out.avail || o.ok != e.out.ok || m != e.m || cb != e.cb || poff != e.poff)
+    if (o.buffer != got.buffer || o.offset != got.offset || o.avail != got.avail || o.ok != got.ok || m != e.m || cb != e.cb || poff != got_poff)
         if (g_bm_bad++ < 20)
             NXLOG_W("nvn.rtcheck", "mismatch: bind memo (address 0x%llx, size 0x%llx)", static_cast<unsigned long long>(gpu_address),
                     static_cast<unsigned long long>(size));
@@ -1300,14 +1324,13 @@ BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use) {
     if (g_mirror_on && size && bind_memo_on() && !g_have_copies.load(std::memory_order_relaxed)) {
         pgen = pool_gen();                                   // read before the lookup: a change during it leaves the entry stale
         bgen = g_bind_gen.load(std::memory_order_acquire);
-        e = &t_bind_memo[static_cast<size_t>(((gpu_address >> 4) ^ (size << 7)) * 0x9E3779B97F4A7C15ull >> 56) % kBindMemoWays];
-        if (e->addr == gpu_address && e->size == size && e->pool_gen == pgen && e->bind_gen == bgen) {
+        const uint64_t region = gpu_address >> kBindMemoShift;
+        e = &t_bind_memo[static_cast<size_t>((region * 0x9E3779B97F4A7C15ull) >> 56) % kBindMemoWays];
+        if (e->region == region && e->pool_gen == pgen && e->bind_gen == bgen && bind_memo_answer(*e, gpu_address, size, &out, &poff)) {
             ++g_bm_hits;
-            out = e->out;
             m = e->m;
             cb = e->cb;
-            poff = e->poff;
-            if (check) bind_memo_check(gpu_address, size, *e);
+            if (check) bind_memo_check(gpu_address, size, *e, out, poff);
         }
     }
     if (!cb) {
@@ -1325,14 +1348,26 @@ BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use) {
         if (!cb) { g_use_skip[use]++; g_skip_why[4]++; return out; }
         if (e) {
             ++g_bm_misses;
-            e->addr = gpu_address;
-            e->size = size;
-            e->pool_gen = pgen;
-            e->bind_gen = bgen;
-            e->poff = poff;
-            e->out = out;
-            e->m = m;
-            e->cb = cb;
+            // remember the region only when the range sits in its regular import chunk (not a span)
+            const uint64_t k = poff / pg->stride;
+            const PoolChunk* c = k < pg->chunks.size() ? &pg->chunks[static_cast<size_t>(k)] : nullptr;
+            if (c && c->buffer == out.buffer && out.offset == poff - c->off + c->buffer_offset) {
+                e->region = gpu_address >> kBindMemoShift;
+                e->pool_gen = pgen;
+                e->bind_gen = bgen;
+                e->pool_lo = mp->gpu_base;
+                e->pool_hi = mp->gpu_base + mp->size;
+                e->pg_base = reinterpret_cast<uint64_t>(pg->base);
+                e->c_lo = k * pg->stride;
+                e->c_hi = std::min<uint64_t>((k + 1) * pg->stride, pg->size);
+                e->c_off = c->off;
+                e->c_size = c->size;
+                e->c_boff = c->buffer_offset;
+                e->c_buf = c->buffer;
+                e->m = m;
+                e->mci = f / chunk_pages;
+                e->cb = cb;
+            }
         }
     }
     const uint64_t first = poff / kPageBytes, last = (poff + size - 1) / kPageBytes;

@@ -171,7 +171,6 @@ enum ReadUse { kReadVertex = 0, kReadIndex = 1, kReadUniform = 2, kReadStorage =
 void storage_probe(uint64_t gpu_address, uint64_t size, bool vertex);   // [nvn] storage_read_copy diagnostics
 enum WriteUse { kWriteStorage = 0, kWriteXfb = 1, kWriteImageCopy = 2, kWriteUpdate = 3, kWriteFill = 4, kWriteCopy = 5 };
 BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use);
-void vb_keep_log();   // [nvn] vb_keep's counts, on the pool summary line's schedule (nvn_replay.cpp)
 // The device-local copy of [gpu_address, +size) for the compute shadows (nvn_replay.cpp): its chunk and offset (buf null: no copy for it, or the
 // range spans two chunks), and whether the copy holds the pool's bytes right now. Call it before note_gpu_write invalidates the range.
 struct MirrorSpan { VkBuffer buf = VK_NULL_HANDLE; VkDeviceSize offset = 0; bool valid = false; VkDeviceSize avail = 0; };   // avail: bytes to the chunk's end
