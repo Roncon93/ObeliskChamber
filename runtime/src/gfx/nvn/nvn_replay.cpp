@@ -238,9 +238,12 @@ bool g_mask_ready = false, g_mask_ok = false;
 // formats and extents).
 // kDescUbo: only uniform buffers (or graphics push constants, which are bound as one) changed; the draw treats it as kDesc unless the
 // uniform-only rebind applies (begin_draw).
+// kVbForget: the command buffer's vertex buffer bindings are not known ([nvn] vb_keep): a new command buffer, or something bound other
+// pipelines (all of which set every bit).
 enum : uint32_t {
     kPipe = 1, kDesc = 2, kVb = 4, kDynVp = 8, kDynRaster = 16, kDynDepth = 32, kDynStencil = 64, kDynBias = 128, kDynBlend = 256, kDescUbo = 512,
-    kAllDirty = 0x3ff
+    kVbForget = 1024,
+    kAllDirty = 0x7ff
 };
 uint32_t g_dirty = kAllDirty;
 // The program layout and command buffer of the last draw that bound all its descriptor sets (bind_sets): a uniform-only rebind keeps
@@ -348,6 +351,18 @@ bool occ_ready() {
 uint8_t g_key_dummy_binding = 0;      // 1 + the binding that feeds the defaults of unset vertex attributes (0: none)
 bool g_want_depth_ro = false;         // some texture this draw samples is the current depth attachment
 bool g_vb_bound_in_cb = false;        // vkCmdBindVertexBuffers2 was called in this command buffer (dynamic strides need one)
+// [nvn] vb_keep (default off until measured; code review RT4): Vulkan keeps vertex buffer bindings (and, with the dynamic stride every replay
+// pipeline has, their strides) across pipeline binds, but every program change bound every used binding again (~900 pipeline changes a
+// frame at 1,700 draws). With it on, a binding is only bound when its buffer, offset, size or stride differ from what this command buffer
+// holds for it. The resolve still runs for each, so a page that went stale still moves the binding to the pool.
+bool vb_keep_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "vb_keep", false);
+    return on;
+}
+struct VbHeld { VkBuffer buf; VkDeviceSize off, size, stride; };
+VbHeld g_vb_held[16];
+uint32_t g_vb_have = 0;                 // bit b: binding b holds g_vb_held[b] in this command buffer
+int64_t g_vb_n_bound = 0, g_vb_n_kept = 0;   // bindings bound, bindings left as they were (vb_keep)
 
 // [nvn] trace_frame = N (NXRT_NVN_TRACE_FRAME): every draw, clear, copy and dispatch of the frame that is presented as number N is logged
 // at Info ("trace ..." lines): programs, render targets, sampled textures, blend and depth state. For finding out what a frame does.
@@ -475,6 +490,13 @@ void chk(bool ok, const char* what) {
     ++g_chk_n;
     if (!ok && g_chk_bad++ < 20) NXLOG_W("nvn.rtcheck", "mismatch: %s", what);
 }
+}  // namespace
+void vb_keep_log() {
+    if (vb_keep_on())
+        NXLOG_I("nvn.replay", "vertex buffer bindings (vb_keep): %lld bound, %lld kept as the command buffer held them", static_cast<long long>(g_vb_n_bound),
+                static_cast<long long>(g_vb_n_kept));
+}
+namespace {
 int64_t rs_every() {
     static const int64_t n = nxrt::config_get_int("nvn", "replay_stats", 0);
     return n;
@@ -817,6 +839,7 @@ void maybe_split() {
     g_topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     g_restart_valid = false;
     g_vb_bound_in_cb = false;
+    g_vb_have = 0;
     vrs_reset();
     g_split_t0 = now;
     g_split_draws = 0;
@@ -3769,11 +3792,22 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
             vsize[binding] = vb.size ? std::min<VkDeviceSize>(vb.size, br.avail) : br.avail;
             vstride[binding] = static_cast<VkDeviceSize>(S.stream[binding].stride);
         }
+        const bool keep = vb_keep_on();
+        if (g_dirty & kVbForget) g_vb_have = 0;
+        if (keep)
+            for (uint32_t b = 0; b < 16; ++b)
+                if (vset[b] && (g_vb_have >> b & 1) && g_vb_held[b].buf == vbuf[b] && g_vb_held[b].off == voff[b] && g_vb_held[b].size == vsize[b] &&
+                    g_vb_held[b].stride == vstride[b]) {
+                    vset[b] = false;            // this command buffer holds exactly that binding already
+                    ++g_vb_n_kept;
+                }
         for (uint32_t b = 0; b < 16;) {
             if (!vset[b]) { ++b; continue; }
             uint32_t e = b + 1;
             while (e < 16 && vset[e]) ++e;
             vkCmdBindVertexBuffers2(F->cb, b, e - b, vbuf + b, voff + b, vsize + b, vstride + b);
+            for (uint32_t k = b; k < e; ++k) { g_vb_held[k] = {vbuf[k], voff[k], vsize[k], vstride[k]}; g_vb_have |= 1u << k; }
+            g_vb_n_bound += e - b;
             g_vb_bound_in_cb = true;
             b = e;
         }
@@ -3782,6 +3816,8 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
             VkBuffer dummy = dummy_buffer();
             VkDeviceSize off = 0, size = 65536, stride = 0;
             vkCmdBindVertexBuffers2(F->cb, 0, 1, &dummy, &off, &size, &stride);
+            g_vb_held[0] = {dummy, off, size, stride};
+            g_vb_have |= 1u;
             g_vb_bound_in_cb = true;
         }
     }
@@ -6208,6 +6244,7 @@ void replay_begin_submit(Frame& f) {
     g_topo = g_pipe_topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM; vrs_reset();
     g_restart_valid = false;
     g_vb_bound_in_cb = false;
+    g_vb_have = 0;
     g_want_depth_ro = false;
     g_fb_use.clear();
     g_fb_seen = false;

@@ -120,6 +120,9 @@ constexpr uint64_t kSlab = 16ull << 20;
 std::mutex g_copies_mu;
 std::unordered_set<PoolChunk*> g_copies;
 std::atomic<bool> g_have_copies{false};
+// [nvn] bind_memo: moves whenever an import, a pool's Vulkan side or a mirror (or one of its chunks) goes away or is swapped, so the
+// per-thread bind memo (resolve_read) never hands out a buffer that changed under it.
+std::atomic<uint64_t> g_bind_gen{0};
 std::atomic<bool> g_copy_touched{false};   // the submission being recorded uses a copy buffer (render thread sets it, pool_copy_begin clears it)
 // A pool part on a copy buffer tries the real import again after this many presents, then after twice that, up to 16 times as long (the
 // import failed under memory pressure, which may be gone a minute later).
@@ -308,6 +311,7 @@ bool import_range(PoolGpu* g, PoolChunk& c, uint64_t off, uint64_t size, const c
 }
 
 void destroy_chunk(PoolChunk& c) {
+    g_bind_gen.fetch_add(1, std::memory_order_release);
     if (c.backing) { c = PoolChunk{}; return; }
     gfx::Device& dev = device();
     if (c.copy.buffer) {
@@ -670,6 +674,7 @@ void retry_imports() {
                 static_cast<unsigned long long>(c->off), static_cast<unsigned long long>(c->size >> 10));
         auto* old = new PoolChunk(std::move(*c));
         *c = std::move(fresh);
+        g_bind_gen.fetch_add(1, std::memory_order_release);
         defer_destroy([old] { destroy_chunk(*old); delete old; });
     }
 }
@@ -743,6 +748,7 @@ void pool_gpu_destroy(PoolGpu* p) {
         if (!was_live && !p->failed) return;   // already destroyed by pool_shutdown
     }
     if (was_live) g_gauge_pools_live.sub(1);
+    g_bind_gen.fetch_add(1, std::memory_order_release);
     if (p->mirror) mirror_destroy(p);
     for (PoolChunk& c : p->chunks) destroy_chunk(c);
     for (PoolChunk& c : p->spans) destroy_chunk(c);
@@ -1010,6 +1016,27 @@ bool copyable(const Mirror& m, uint64_t i, uint32_t now) {
     return bit_get(m.want, i) && !page_valid(m, i) && !new_get(m, i) && m.hot_until[static_cast<size_t>(i)] <= now && !mem::ww::page_banned(m.ww, i);
 }
 
+// [nvn] bind_memo (default off until measured; code review RT2): every vertex, index, uniform and storage binding of every draw went through
+// the whole pool and mirror lookup (pool_lookup, the import's chunk, mirror_for's walk over the chunks and spans, the mirror's chunk), ~6%
+// of the render thread, while draws bind the same few ranges over and over. A small per-thread memo keyed by (address, size) keeps the
+// answer of that lookup: the import's BufRef, the mirror and its chunk. It is used only while no pool was registered or removed
+// (pool_gen) and no import, pool or mirror chunk went away or was swapped (g_bind_gen), and never while copy buffers exist (their use has
+// side effects). Whether the pages are valid is still checked on every bind: only the structure is remembered. [nvn] rt_check compares
+// every hit with the full lookup.
+bool bind_memo_on() {
+    static const bool on = config_get_bool("nvn", "bind_memo", false);
+    return on;
+}
+struct BindMemo {
+    uint64_t addr = 0, size = 0, pool_gen = ~0ull, bind_gen = ~0ull, poff = 0;
+    BufRef out;                   // resolve_in_pool's answer (the import)
+    Mirror* m = nullptr;
+    VkBuffer cb = VK_NULL_HANDLE; // the mirror chunk holding the range
+};
+constexpr size_t kBindMemoWays = 256;
+thread_local BindMemo t_bind_memo[kBindMemoWays];
+int64_t g_bm_hits = 0, g_bm_misses = 0, g_bm_checks = 0, g_bm_bad = 0;   // render thread, like the bind counters above
+
 void log_summary(uint32_t now) {
     static uint32_t last = 0;
     if (now - last < 1200) return;
@@ -1049,6 +1076,10 @@ void log_summary(uint32_t now) {
             (long long)g_host_why[0][6], (long long)g_host_why[1][6], (long long)g_host_why[2][6]);
     NXLOG_I(kTag, "pool mirror wanted pages at submission start (pages, %lld submissions): copied %lld, valid already %lld, hot %lld, banned %lld, compute result %lld, deferred %lld",
             (long long)g_want_fate[6], (long long)g_want_fate[0], (long long)g_want_fate[1], (long long)g_want_fate[2], (long long)g_want_fate[3], (long long)g_want_fate[4], (long long)g_want_fate[5]);
+    if (bind_memo_on())
+        NXLOG_I(kTag, "bind memo: %lld hits, %lld misses; rt_check %lld checked, %lld mismatches", static_cast<long long>(g_bm_hits),
+                static_cast<long long>(g_bm_misses), static_cast<long long>(g_bm_checks), static_cast<long long>(g_bm_bad));
+    vb_keep_log();
     if (hot_copy_on()) NXLOG_I(kTag, "pool mirror hot copy: %lld pages copied in %lld submissions (over the budget %lld times), %lld binds served from them",
             (long long)g_hotcopy_pages, (long long)g_hotcopy_subs, (long long)g_hotcopy_over, (long long)g_hotcopy_binds);
     std::vector<const Mirror*> top(g_mirrors.begin(), g_mirrors.end());
@@ -1240,21 +1271,71 @@ void storage_probe(uint64_t gpu_address, uint64_t size, bool vertex) {
     g_sto_bytes[s][row] += size;
 }
 
-BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use) {
+namespace {
+void bind_memo_check(uint64_t gpu_address, uint64_t size, const BindMemo& e) {
     MemoryPool* mp = nullptr;
     PoolGpu* pg = nullptr;
     uint64_t poff = 0;
-    BufRef out = resolve_in_pool(gpu_address, size, &mp, &pg, &poff);
-    if (!g_mirror_on) return out;
-    if (!out.ok || !pg || !size) { g_use_skip[use]++; g_skip_why[0]++; return out; }
-    const uint64_t first = poff / kPageBytes, last = (poff + size - 1) / kPageBytes;
-    if (last - first + 1 > kMaxBindPages) { g_use_skip[use]++; g_skip_why[1]++; return out; }
-    Mirror* m = mirror_for(pg, mp);
-    if (!m || last >= m->npages) { g_use_skip[use]++; g_skip_why[2]++; return out; }
+    const BufRef o = resolve_in_pool(gpu_address, size, &mp, &pg, &poff);
+    Mirror* m = pg ? mirror_for(pg, mp) : nullptr;
+    const VkBuffer cb = m && poff / kPageBytes < m->npages ? mirror_chunk(*m, poff / kPageBytes) : VK_NULL_HANDLE;
+    ++g_bm_checks;
+    if (o.buffer != e.out.buffer || o.offset != e.out.offset || o.avail != e.out.avail || o.ok != e.out.ok || m != e.m || cb != e.cb || poff != e.poff)
+        if (g_bm_bad++ < 20)
+            NXLOG_W("nvn.rtcheck", "mismatch: bind memo (address 0x%llx, size 0x%llx)", static_cast<unsigned long long>(gpu_address),
+                    static_cast<unsigned long long>(size));
+}
+
+}  // namespace
+
+BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use) {
+    static const bool check = config_get_bool("nvn", "rt_check", false);
     const uint64_t chunk_pages = kChunkBytes / kPageBytes;
-    if (first / chunk_pages != last / chunk_pages) { g_use_skip[use]++; g_skip_why[3]++; return out; }
-    const VkBuffer cb = mirror_chunk(*m, first);
-    if (!cb) { g_use_skip[use]++; g_skip_why[4]++; return out; }
+    BufRef out;
+    Mirror* m = nullptr;
+    VkBuffer cb = VK_NULL_HANDLE;
+    uint64_t poff = 0;
+    BindMemo* e = nullptr;
+    uint64_t pgen = 0, bgen = 0;
+    if (g_mirror_on && size && bind_memo_on() && !g_have_copies.load(std::memory_order_relaxed)) {
+        pgen = pool_gen();                                   // read before the lookup: a change during it leaves the entry stale
+        bgen = g_bind_gen.load(std::memory_order_acquire);
+        e = &t_bind_memo[static_cast<size_t>(((gpu_address >> 4) ^ (size << 7)) * 0x9E3779B97F4A7C15ull >> 56) % kBindMemoWays];
+        if (e->addr == gpu_address && e->size == size && e->pool_gen == pgen && e->bind_gen == bgen) {
+            ++g_bm_hits;
+            out = e->out;
+            m = e->m;
+            cb = e->cb;
+            poff = e->poff;
+            if (check) bind_memo_check(gpu_address, size, *e);
+        }
+    }
+    if (!cb) {
+        MemoryPool* mp = nullptr;
+        PoolGpu* pg = nullptr;
+        out = resolve_in_pool(gpu_address, size, &mp, &pg, &poff);
+        if (!g_mirror_on) return out;
+        if (!out.ok || !pg || !size) { g_use_skip[use]++; g_skip_why[0]++; return out; }
+        const uint64_t f = poff / kPageBytes, l = (poff + size - 1) / kPageBytes;
+        if (l - f + 1 > kMaxBindPages) { g_use_skip[use]++; g_skip_why[1]++; return out; }
+        m = mirror_for(pg, mp);
+        if (!m || l >= m->npages) { g_use_skip[use]++; g_skip_why[2]++; return out; }
+        if (f / chunk_pages != l / chunk_pages) { g_use_skip[use]++; g_skip_why[3]++; return out; }
+        cb = mirror_chunk(*m, f);
+        if (!cb) { g_use_skip[use]++; g_skip_why[4]++; return out; }
+        if (e) {
+            ++g_bm_misses;
+            e->addr = gpu_address;
+            e->size = size;
+            e->pool_gen = pgen;
+            e->bind_gen = bgen;
+            e->poff = poff;
+            e->out = out;
+            e->m = m;
+            e->cb = cb;
+        }
+    }
+    const uint64_t first = poff / kPageBytes, last = (poff + size - 1) / kPageBytes;
     if (range_valid(*m, first, last - first + 1) || (out_lazy() && new_servable(*m, first, last))) {
         out.buffer = cb;
         out.offset = poff - (first / chunk_pages) * kChunkBytes;
@@ -1596,6 +1677,7 @@ void mirror_begin_submit(Frame& f, bool on) {
 void mirror_destroy(PoolGpu* p) {
     Mirror* m = p->mirror;
     if (!m) return;
+    g_bind_gen.fetch_add(1, std::memory_order_release);
     p->mirror = nullptr;
     out_unregister(m);
     g_mirrors.erase(std::remove(g_mirrors.begin(), g_mirrors.end(), m), g_mirrors.end());
