@@ -616,6 +616,12 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
     pl.layout = sh->second.layout;
     pl.push_stages = pcr.stageFlags;
     pl.push_bytes = pcr.size;
+    // ProgLayout::writes_storage: begin_draw walked every binding of the program for this on each draw that changed its descriptors
+    // (technique from EmblemWeave, ported to fefw-recomp in #82)
+    static const bool ssbo_ro_pass = config_get_bool("nvn", "gfx_ssbo_readonly", true);
+    for (const BindingDesc& d : pl.bindings)
+        pl.writes_storage |= (d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !(ssbo_ro_pass && !d.shader->refl.bindings[d.index].written)) ||
+                             d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     return &g_layouts.emplace(key, std::move(pl)).first->second;
 }
 

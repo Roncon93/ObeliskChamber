@@ -3455,6 +3455,29 @@ const ProgLayout* layout_cached(const ShaderInfo* const stages[6]) {
     return pl;
 }
 
+// [nvn] alpha_cache (default on): the alpha-test variants of recently drawn programs' layouts, direct mapped on the base layout, in front of
+// alpha_layout's lock and map (the same reason as layout_cache: a busy frame crosses it hundreds of times). Layouts live until pipeline_shutdown,
+// which frees them; replay_shutdown clears this table with layout_cache, so a variant cannot come back from a reused address. Technique from
+// EmblemWeave (5eabfc7), as fefw-recomp ported it (#82, metrist38).
+struct AlphaCacheSlot { const ProgLayout* base = nullptr; const ProgLayout* alpha = nullptr; };
+AlphaCacheSlot g_alpha_cache[64];
+const ProgLayout* alpha_layout_cached(const ProgLayout& base) {
+    if (base.push_bytes || base.alpha_push) return &base;   // no variant: alpha_layout's own answer, without a slot
+    static const bool on = nxrt::config_get_bool("nvn", "alpha_cache", true);
+    if (!on) return alpha_layout(base);
+    AlphaCacheSlot& sl = g_alpha_cache[(reinterpret_cast<uintptr_t>(&base) >> 4) & 63];
+    if (sl.base == &base) {
+        if (rt_check()) chk(alpha_layout(base) == sl.alpha, "alpha cache");
+        return sl.alpha;
+    }
+    const ProgLayout* a = alpha_layout(base);
+    if (a != &base) {   // a layout that failed returns base and is tried again at the next draw, as without the table
+        sl.base = &base;
+        sl.alpha = a;
+    }
+    return a;
+}
+
 // [nvn] depth_ro_sticky (default true in this fork): a draw that does not sample the depth target and writes neither depth nor stencil stays in an
 // open pass whose depth attachment is read-only, instead of ending it for a writable one. The transparent and particle draws of a frame
 // (depth test on, depth writes off) where only some of them sample the depth (soft particles) then stay in one pass, without a layout
@@ -3510,7 +3533,7 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
     if (!pl) return false;
     g_alpha_draw = false;
     if (alpha_test_wanted()) {
-        const ProgLayout* ap = alpha_layout(*pl);
+        const ProgLayout* ap = alpha_layout_cached(*pl);
         if (ap != pl) { pl = ap; g_alpha_draw = true; }
     }
     if (pl != g_last_draw_pl) {   // another layout than the last draw's (the alpha test came or went): the sets and the pipeline are bound again
@@ -3532,10 +3555,7 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
     rs_mark(kRsHead);
     if (g_dirty & (kDesc | kPipe)) {
         ++g_rs.draws_desc;
-        g_prog_writes = false;
-        static const bool ssbo_ro_pass = nxrt::config_get_bool("nvn", "gfx_ssbo_readonly", true);
-        for (const BindingDesc& d : pl->bindings)
-            g_prog_writes |= (d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !(ssbo_ro_pass && !d.shader->refl.bindings[d.index].written)) || d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        g_prog_writes = pl->writes_storage;   // worked out once per layout (prog_layout), not over every binding per draw
         attach_targets(false);
         g_want_depth_ro = samples_depth_target(*pl);
         prepare_textures(*pl);
@@ -6387,6 +6407,7 @@ void replay_shutdown() {
     pipeline_shutdown();
     g_pl = nullptr;                // the layouts are gone with the pipelines
     for (LayoutCacheSlot& sl : g_layout_cache) sl = LayoutCacheSlot();
+    for (AlphaCacheSlot& sl : g_alpha_cache) sl = AlphaCacheSlot();
     S = GState();
     g_out_all = true;              // out_draw_bindings: every slot again
     out_dirty_clear();
