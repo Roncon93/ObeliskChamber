@@ -169,28 +169,54 @@ bool prep_ahead_on() {
     static const bool on = config_get_bool("nvn", "prep_ahead", false);
     return on;
 }
-// [nvn] pass_labels (default off; a profiling aid for GPU capture tools such as Nsight GPU Trace): every render pass and every compute
+// [nvn] pass_labels (default 0; a profiling aid for GPU capture tools such as Nsight GPU Trace). 1: every render pass and every compute
 // dispatch of the replay gets a Vulkan debug label of its own, inside the game's own debug groups, so a capture splits a command list by
-// pass. A pass is "pNNN WxH cN:format dFormat" (Vulkan format numbers) (NNN counts the frame's passes, so the same pass has the same name in the next frame);
-// a dispatch is "cs <first 8 digits of the shader's hash>". Labels are a stack: when the game pushes or pops a group of its own in the
-// middle of a pass, the pass's label is closed first and opened again after it.
-bool pass_labels_on() {
-    static const bool on = config_get_bool("nvn", "pass_labels", false) && device().features().debug_labels && vkCmdBeginDebugUtilsLabelEXT &&
-                           vkCmdEndDebugUtilsLabelEXT;
-    return on;
+// pass. A pass is "pNNN WxH cN:format dFormat" (Vulkan format numbers; NNN counts the frame's passes, so the same pass has the same name
+// in the next frame); a dispatch is "cs <first 8 digits of the shader's hash>". 2: also, inside a pass, one label "fs <hash>" per run of
+// draws with the same fragment shader, so the capture gives the time per shader. Labels are a stack: when the game pushes or pops a
+// group of its own in the middle of a pass, the pass's labels are closed first and opened again after it.
+int pass_labels_level() {
+    static const int level = device().features().debug_labels && vkCmdBeginDebugUtilsLabelEXT && vkCmdEndDebugUtilsLabelEXT
+                                 ? static_cast<int>(std::clamp<int64_t>(config_get_int("nvn", "pass_labels", 0), 0, 2))
+                                 : 0;
+    return level;
 }
-char g_pass_label[64];
-bool g_pass_label_open = false;
-void pass_label_begin(VkCommandBuffer cb) {
+bool pass_labels_on() { return pass_labels_level() > 0; }
+char g_pass_label[64], g_fs_label[16];
+bool g_pass_label_open = false, g_fs_label_open = false;
+const void* g_fs_label_of = nullptr;     // the fragment shader the open "fs" label names
+void label_begin(VkCommandBuffer cb, const char* name) {
     VkDebugUtilsLabelEXT l = {VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
-    l.pLabelName = g_pass_label;
-    vkCmdBeginDebugUtilsLabelEXT(cb, &l);
+    l.pLabelName = name;
+    vkCmdBeginDebugUtilsLabelEXT(cb, &l);     // the recording worker copies the name (nvn_cmdq.cpp)
+}
+void pass_label_begin(VkCommandBuffer cb) {
+    label_begin(cb, g_pass_label);
     g_pass_label_open = true;
 }
-void pass_label_end(VkCommandBuffer cb) {
-    if (!g_pass_label_open) return;
+void fs_label_end(VkCommandBuffer cb) {
+    if (!g_fs_label_open) return;
     vkCmdEndDebugUtilsLabelEXT(cb);
+    g_fs_label_open = false;
+}
+// Closes the pass's labels; returns what pass_labels_resume opens again (bit 0: the pass, bit 1: the shader run).
+int pass_labels_suspend(VkCommandBuffer cb) {
+    const int was = (g_pass_label_open ? 1 : 0) | (g_fs_label_open ? 2 : 0);
+    fs_label_end(cb);
+    if (g_pass_label_open) vkCmdEndDebugUtilsLabelEXT(cb);
     g_pass_label_open = false;
+    return was;
+}
+void pass_labels_resume(VkCommandBuffer cb, int was) {
+    if (was & 1) pass_label_begin(cb);
+    if (was & 2) {
+        label_begin(cb, g_fs_label);
+        g_fs_label_open = true;
+    }
+}
+void pass_label_end(VkCommandBuffer cb) {
+    pass_labels_suspend(cb);
+    g_fs_label_of = nullptr;
 }
 uint64_t target_key(uint32_t ncolor, const Target* color, const Target& depth) {
     uint64_t h = 0xcbf29ce484222325ull ^ ncolor;
@@ -4116,6 +4142,16 @@ void draw_log(uint32_t count, uint32_t instances, bool indexed) {
 }
 
 void census_draw() {
+    if (g_pass_label_open && pass_labels_level() >= 2) {     // [nvn] pass_labels = 2: a label per run of draws with one fragment shader
+        const ShaderInfo* f = S.stage[kFragment];
+        if (!g_fs_label_open || g_fs_label_of != f) {
+            fs_label_end(F->cb);
+            std::snprintf(g_fs_label, sizeof g_fs_label, "fs %.8s", f ? f->hash.c_str() : "-");
+            label_begin(F->cb, g_fs_label);
+            g_fs_label_open = true;
+            g_fs_label_of = f;
+        }
+    }
     if (!g_census) return;
     char b[160];
     const ShaderInfo* fs = S.stage[kFragment];
@@ -5209,9 +5245,7 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
     const bool cs_label = pass_labels_on();
     if (cs_label) {
         const std::string name = "cs " + cs->hash.substr(0, 8);
-        VkDebugUtilsLabelEXT l = {VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
-        l.pLabelName = name.c_str();
-        vkCmdBeginDebugUtilsLabelEXT(F->cb, &l);     // the recording worker copies the name (nvn_cmdq.cpp)
+        label_begin(F->cb, name.c_str());
     }
     if (indirect) {
         vkCmdDispatchIndirect(F->cb, ind.buffer, ind.offset);
@@ -5984,22 +6018,20 @@ void run_list(const CmdList& list, int depth) {
             case Op::DrawXfb: do_draw_xfb(r.payload<P_DrawXfb>()); break;
             case Op::PushDebugGroup:
                 if (device().features().debug_labels && vkCmdBeginDebugUtilsLabelEXT) {
-                    const bool reopen = g_pass_label_open;     // [nvn] pass_labels: the game's group goes under the pass's label, not inside it
-                    pass_label_end(F->cb);
+                    const int reopen = pass_labels_suspend(F->cb);     // [nvn] pass_labels: the game's group goes under the pass's labels, not inside them
                     VkDebugUtilsLabelEXT l = {VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
                     l.pLabelName = reinterpret_cast<const char*>(r.blob<P_DebugGroup>());
                     vkCmdBeginDebugUtilsLabelEXT(F->cb, &l);
                     ++g_dbg_depth;
-                    if (reopen) pass_label_begin(F->cb);
+                    pass_labels_resume(F->cb, reopen);
                 }
                 break;
             case Op::PopDebugGroup:
                 if (g_dbg_depth > 0 && vkCmdEndDebugUtilsLabelEXT) {     // a pop whose push was in an earlier submission has nothing to close
-                    const bool reopen = g_pass_label_open;
-                    pass_label_end(F->cb);
+                    const int reopen = pass_labels_suspend(F->cb);
                     vkCmdEndDebugUtilsLabelEXT(F->cb);
                     --g_dbg_depth;
-                    if (reopen) pass_label_begin(F->cb);
+                    pass_labels_resume(F->cb, reopen);
                 }
                 break;
             case Op::DrawTexture: note_unsupported("DrawTexture"); break;
