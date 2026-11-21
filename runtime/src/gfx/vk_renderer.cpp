@@ -1015,11 +1015,19 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
     si.commandBufferInfoCount = static_cast<uint32_t>(cbs.size());
     si.pCommandBufferInfos = cbs.data();
     VkSemaphoreSubmitInfo signals[3] = {};
+    VkSemaphoreSubmitInfo waits[2] = {};
     if (!s.headless) {
-        si.waitSemaphoreInfoCount = 1;
-        si.pWaitSemaphoreInfos = &wait;
+        waits[si.waitSemaphoreInfoCount++] = wait;
         signals[si.signalSemaphoreInfoCount++] = signal;
     }
+    if (prefix && prefix->wait) {
+        VkSemaphoreSubmitInfo& fw = waits[si.waitSemaphoreInfoCount++];
+        fw = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+        fw.semaphore = prefix->wait;
+        fw.value = prefix->wait_value;
+        fw.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    }
+    si.pWaitSemaphoreInfos = waits;
     if (prefix && prefix->timeline) {
         VkSemaphoreSubmitInfo& tl = signals[si.signalSemaphoreInfoCount++];
         tl = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};

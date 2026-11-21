@@ -231,7 +231,7 @@ void present_on_render_thread(Window* w, int index, bool again) {
     extras::framegen_present_begin(fi.cmd, fi.extent, VkExtent2D{e.width, e.height}, crop, keep_aspect(), again);
     render_status::set_screen(static_cast<int>(fi.extent.width), static_cast<int>(fi.extent.height));
     const uint64_t call_start = FrameLimiter::now_ns();
-    { NXFT("present.end"); nxrt::HitchTimer ht(nxrt::kHpRenderPresentEnd); rend->end_frame(merged ? &pre : nullptr); }
+    { NXFT("present.end"); nxrt::HitchTimer ht(nxrt::kHpRenderPresentEnd); rend->end_frame(merged || pre.wait ? &pre : nullptr); }
     const uint64_t call_ns = FrameLimiter::now_ns() - call_start;
     extras::framegen_present_end();
     if (merged) present_batch_done(pre);

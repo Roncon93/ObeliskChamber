@@ -1277,9 +1277,18 @@ void submit_recorded() {
     if (g) flush_batch();
 }
 
+// Not merged ([nvn] submit_batch other than frame, or nothing recorded): the frame's work went to the GPU in submissions of its own, and the
+// present's submission is told to wait for the last of them on the timeline. Without that only the barriers recorded in the present's
+// command buffer order it after the game's drawing; the Xenoblade 2 recomp (weile10000/xc2-ns2-recomp a758fae) saw the present read a
+// half-drawn frame that way. [nvn] present_wait = 0 leaves the wait out (A/B test).
 bool take_batch_for_present(std::vector<VkCommandBuffer>* cmds, gfx::Renderer::SubmitPrefix* p) {
     if (!g || !g->frame_batch || g->batch.empty()) {
         submit_recorded();
+        static const bool wait = nxrt::config_get_bool("nvn", "present_wait", true);
+        if (g && wait && g->flushed) {
+            p->wait = g->timeline;
+            p->wait_value = g->flushed;
+        }
         return false;
     }
     cmds->clear();

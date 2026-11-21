@@ -320,6 +320,10 @@ public:
         VkSemaphore timeline = VK_NULL_HANDLE;
         uint64_t value = 0;
         bool submitted = false;           // out: vkQueueSubmit2 succeeded
+        // A timeline value the frame's submission waits for before it starts (any stage), with or without cmds: the frame's own work when
+        // it went to the GPU in a submission of its own before this one.
+        VkSemaphore wait = VK_NULL_HANDLE;
+        uint64_t wait_value = 0;
     };
     // Runs the overlay hook, finishes and submits the command buffer (GPU timestamp 1), saves a requested screenshot and
     // presents.

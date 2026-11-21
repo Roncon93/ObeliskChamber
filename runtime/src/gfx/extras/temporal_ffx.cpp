@@ -9,6 +9,7 @@
 
 #include "extras/ffx_files.h"
 #include "extras/temporal.h"
+#include "nxrt/config.h"
 #include "nxrt/extras.h"
 #include "nxrt/gfx.h"
 #include "nxrt/log.h"
@@ -127,9 +128,51 @@ private:
         be.deviceContext.vkDevice = dev_->device();
         be.deviceContext.vkPhysicalDevice = dev_->physical();
         be.deviceContext.vkDeviceProcAddr = vkGetDeviceProcAddr;
+        // [upscale] fsr_version (auto, default): the SDK 2.x upscaler DLL carries FSR 3.1 and FSR 4 and hands out the newest one it has
+        // for the GPU unless told otherwise. On an RDNA2 card that was the FSR 4 model at 0.1 fps, and FSR 4.1.2 crashed AMD's driver in
+        // vkCmdPipelineBarrier (4 crashes in 21 min against none in 236 min of 3.1.6), both measured by the Xenoblade 2 recomp
+        // (weile10000/xc2-ns2-recomp). auto asks for 3.1 except on RDNA 4 (RX 9000), the GPUs FSR 4 is made for; "3.1", "4" or any
+        // other prefix of a version name asks for that one. The v1.1.4 DLL offers only 3.1, so nothing changes with it.
+        ffxOverrideVersion ov = {};
+        bool override_ready = false;
+        {
+            std::string want = nxrt::config_get_str("upscale", "fsr_version", "auto");
+            const VkPhysicalDeviceProperties& pp = dev_->properties();
+            const bool rdna4 = pp.vendorID == 0x1002 && (pp.deviceID & 0xFF00) == 0x7500;   // Navi 44 / 48 (RX 9060 / 9070)
+            if (want.empty() || want == "auto") want = rdna4 ? "" : "3.1";
+            if (!want.empty()) {
+                ffxQueryDescGetVersions qv = {};
+                qv.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+                qv.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+                qv.device = &be.deviceContext;
+                uint64_t count = 8, ids[8] = {};
+                const char* names[8] = {};
+                qv.outputCount = &count;
+                qv.versionIds = ids;
+                qv.versionNames = names;
+                if (query_(nullptr, &qv.header) == FFX_API_RETURN_OK && count > 0) {
+                    std::string list;
+                    for (uint64_t i = 0; i < count && i < 8; ++i) list += std::string(list.empty() ? "" : ", ") + (names[i] ? names[i] : "?");
+                    for (uint64_t i = 0; i < count && i < 8 && !override_ready; ++i) {
+                        if (names[i] && std::string(names[i]).rfind(want, 0) == 0) {
+                            ov.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+                            ov.versionId = ids[i];
+                            ov.header.pNext = &be.header;
+                            override_ready = true;
+                        }
+                    }
+                    static std::string told;
+                    if (told != list + want) {
+                        told = list + want;
+                        if (override_ready) NXLOG_I(kTag, "the DLL offers %s; using %s ([upscale] fsr_version)", list.c_str(), want.c_str());
+                        else NXLOG_W(kTag, "the DLL offers %s, none named %s ([upscale] fsr_version): its default is used", list.c_str(), want.c_str());
+                    }
+                }   // the v1.1.4 DLL answers no version query: it has only FSR 3.1
+            }
+        }
         ffxCreateContextDescUpscale cd = {};
         cd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-        cd.header.pNext = &be.header;
+        cd.header.pNext = override_ready ? &ov.header : &be.header;
         cd.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INVERTED | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
         cd.maxRenderSize = {render.width, render.height};
         cd.maxUpscaleSize = {out.width, out.height};
@@ -141,7 +184,8 @@ private:
             old.vkDevice = dev_->device();
             old.vkPhysicalDevice = dev_->physical();
             old.vkDeviceProcAddr = vkGetDeviceProcAddr;
-            cd.header.pNext = &old.header;
+            if (override_ready) ov.header.pNext = &old.header;
+            cd.header.pNext = override_ready ? &ov.header : &old.header;
             ctx_ = nullptr;
             r = create_(&ctx_, &cd.header, nullptr);
         }
