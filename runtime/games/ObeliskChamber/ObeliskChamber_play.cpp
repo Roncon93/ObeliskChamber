@@ -310,6 +310,7 @@ void play_install(uint64_t base, play::GameHost*, const play::Settings&) {
     if (profile_runtime_linked()) tt::set_exit_handler(&exit_writing_profile);
     s.base = base;
     res_install(base);
+    crowd_install(base);
     detail_install();   // before the game's file system is set up: the graphics settings files are edited as the RomFS is laid out
     msg_install();      // the same: our messages in the dialogs' message files (the System menu's Quit Game)
     twprobe_start(base);
@@ -420,6 +421,7 @@ void set_clock_log(int period_s) {
 void play_remove() {
     State& s = st();
     wide_remove();
+    crowd_remove();
     for (uint32_t* h : {&s.hook, &s.movie_select, &s.movie_count, &s.step_hook, &s.cursor_x, &s.cursor_y}) {
         if (*h) hook_remove(*h);
         *h = 0;

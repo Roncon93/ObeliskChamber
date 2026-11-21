@@ -15,7 +15,7 @@ target_link_libraries(nxrt_game_ObeliskChamber_core PUBLIC nxrt_game_ObeliskCham
 
 if(TARGET nxrt_gfx)
     add_library(nxrt_game_ObeliskChamber STATIC "${_oc}/ObeliskChamber_game.cpp" "${_oc}/ObeliskChamber_play.cpp" "${_oc}/ObeliskChamber_frame.cpp" "${_oc}/ObeliskChamber_detail.cpp" "${_oc}/ObeliskChamber_res.cpp" "${_oc}/ObeliskChamber_twprobe.cpp" "${_oc}/ObeliskChamber_prompts.cpp"
-                "${_oc}/ObeliskChamber_menu.cpp" "${_oc}/ObeliskChamber_wide.cpp" "${_oc}/ObeliskChamber_mouse.cpp" "${_oc}/ObeliskChamber_sysmenu.cpp" "${_oc}/ObeliskChamber_optmenu.cpp" "${_oc}/ObeliskChamber_saveslot.cpp" "${_oc}/ObeliskChamber_modmenu.cpp" "${_oc}/ObeliskChamber_msg.cpp")
+                "${_oc}/ObeliskChamber_menu.cpp" "${_oc}/ObeliskChamber_wide.cpp" "${_oc}/ObeliskChamber_mouse.cpp" "${_oc}/ObeliskChamber_sysmenu.cpp" "${_oc}/ObeliskChamber_optmenu.cpp" "${_oc}/ObeliskChamber_saveslot.cpp" "${_oc}/ObeliskChamber_modmenu.cpp" "${_oc}/ObeliskChamber_msg.cpp" "${_oc}/ObeliskChamber_crowd.cpp")
     target_include_directories(nxrt_game_ObeliskChamber PUBLIC "${_rt}/src/gfx" "${_rt}/src/gfx/play")
     target_link_libraries(nxrt_game_ObeliskChamber PUBLIC nxrt_game_ObeliskChamber_core nxrt_gfx)
 endif()
