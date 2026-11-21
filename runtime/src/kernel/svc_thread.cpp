@@ -134,7 +134,7 @@ void svc_signal_event(::Ctx* c) {              // w0 event handle (writable)
     auto e = handle_as<KEvent>(static_cast<uint32_t>(X(c, 0)));
     if (!e) return svc_ret(c, kInvalidHandle);
     e->state->signaled = true;
-    notify_waitable_changed();
+    notify_waitable_changed(e->state.get());
     svc_ret(c, kOk);
 }
 

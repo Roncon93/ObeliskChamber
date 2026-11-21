@@ -354,6 +354,7 @@ int fefw_run(int argc, char** argv) {
     NXLOG_I("boot", "ObeliskChamber.exe build: %s", fefw_cpu::build_name(g_cpu_needs));
     nxrt::cpu::set_game_build(fefw_cpu::build_name(g_cpu_needs));   // the F1 menu's Debug page shows it
     NXLOG_I("boot", "CPU: %s", nxrt::cpu::summary_line().c_str());
+    NXLOG_I("boot", "power: %s", nxrt::cpu::power_line().c_str());
     NXLOG_I("boot", "%s (update %s): exefs '%s', main '%s', romfs '%s'", nxrt::game::info().title, nxrt::game::info().version, exefs.c_str(),
             main_nso.c_str(), romfs.c_str());
     // a folder, or a .nup package served as the RomFS image; without either the game aborts in its first fs call (issue 142)

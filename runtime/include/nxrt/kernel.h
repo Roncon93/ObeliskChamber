@@ -52,6 +52,9 @@ struct KObject {
     virtual ObjType type() const { return ObjType::Unknown; }
     virtual bool signaled() const { return false; }        // for WaitSynchronization
     virtual void consume() {}                              // called on the object WaitSynchronization returned
+    // What notify_waitable_changed(key) names when this object's signaled state changes ([kernel] per_object_wakes): the object itself,
+    // or the state its handles share (KEvent).
+    virtual const void* wait_key() const { return this; }
 };
 
 struct EventState {
@@ -62,6 +65,7 @@ struct KEvent : KObject {                                  // readable and writa
     bool writable = false;
     ObjType type() const override { return ObjType::Event; }
     bool signaled() const override { return state->signaled; }
+    const void* wait_key() const override { return state.get(); }
 };
 
 struct KSharedMemory : KObject {
@@ -110,6 +114,8 @@ struct KThread : KObject {
     uint32_t wait_result = 0;
     uint64_t wait_mutex = 0, wait_key = 0, wait_addr = 0;
     uint32_t wait_tag = 0;
+    const void* const* sync_keys = nullptr;   // in WaitSynchronization: the wait_key() of each object it waits on
+    int sync_nkeys = 0;
     void* cv_storage[1] = {nullptr};    // CONDITION_VARIABLE is pointer sized: this thread's own wake-up (kernel_sync.cpp)
     std::weak_ptr<KThread> self;
     // [kernel] spin_threads / lock_spin_threads (kernel_sync.cpp): this thread spins on its wake flag before it sleeps / polls a held mutex
@@ -196,7 +202,9 @@ uint32_t wait_for_address(uint64_t addr, uint32_t arb_type, int32_t value, int64
 uint32_t signal_to_address(uint64_t addr, uint32_t signal_type, int32_t value, int32_t count);     // 0 signal, 1 +1 if equal, 2 modify by waiting
 uint32_t wait_synchronization(const uint32_t* handles, int32_t count, int64_t timeout_ns, int32_t* index_out);
 uint32_t cancel_synchronization(uint32_t thread_handle);
-void notify_waitable_changed();          // wake threads blocked in wait_synchronization (call after changing an object's signaled state)
+// Wake threads blocked in wait_synchronization (call after changing an object's signaled state). key: that object's wait_key() (an
+// event's shared state); with [kernel] per_object_wakes only the threads waiting on it are woken. nullptr wakes every waiter.
+void notify_waitable_changed(const void* key = nullptr);
 // A host function that one host thread runs while it is blocked in a kernel wait (WaitSynchronization, mutex, condition variable and address
 // waits, and SleepThread longer than 10 ms): its wait is cut into 10 ms slices and fn runs between them, without the kernel lock. The play layer gives the window's thread one,
 // so the window keeps working while the game waits on something the player must do (the software keyboard applet). fn null: off.

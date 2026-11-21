@@ -174,6 +174,65 @@ std::string summary_line() {
     return buf;
 }
 
+// The Windows power plan and power mode (FR7, as Fritchii logs them): "Power saver", a battery saver mode or a battery that is not charging
+// lowers the processor's clocks, a common cause of low frame rates in player logs. powrprof.dll is loaded here, not linked.
+std::string power_line() {
+    std::string out;
+    HMODULE pp = LoadLibraryW(L"powrprof.dll");
+    if (pp) {
+        using GetActive = DWORD(WINAPI*)(HKEY, GUID**);
+        using ReadName = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*, UCHAR*, DWORD*);
+        using GetOverlay = DWORD(WINAPI*)(GUID*);
+        auto get_active = reinterpret_cast<GetActive>(GetProcAddress(pp, "PowerGetActiveScheme"));
+        auto read_name = reinterpret_cast<ReadName>(GetProcAddress(pp, "PowerReadFriendlyName"));
+        auto get_overlay = reinterpret_cast<GetOverlay>(GetProcAddress(pp, "PowerGetEffectiveOverlayScheme"));   // Windows 10 1809 and newer
+        GUID* scheme = nullptr;
+        if (get_active && get_active(nullptr, &scheme) == ERROR_SUCCESS && scheme) {
+            static const struct { GUID g; const char* name; } kKnown[] = {
+                {{0x381b4222, 0xf694, 0x41f0, {0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e}}, "Balanced"},
+                {{0x8c5e7fda, 0xe8bf, 0x4a96, {0x9a, 0x85, 0xa6, 0xe2, 0x3a, 0x8c, 0x63, 0x5c}}, "High performance"},
+                {{0xa1841308, 0x3541, 0x4fab, {0xbc, 0x81, 0xf7, 0x15, 0x56, 0xf2, 0x0b, 0x4a}}, "Power saver"},
+                {{0xe9a42b02, 0xd5df, 0x448d, {0xaa, 0x00, 0x03, 0xf1, 0x47, 0x49, 0xeb, 0x61}}, "Ultimate Performance"},
+            };
+            const char* known = nullptr;
+            for (const auto& k : kKnown)
+                if (IsEqualGUID(*scheme, k.g)) known = k.name;
+            std::string name = known ? known : "";
+            wchar_t wname[128] = {};
+            DWORD sz = sizeof wname;
+            if (!known && read_name && read_name(nullptr, scheme, nullptr, nullptr, reinterpret_cast<UCHAR*>(wname), &sz) == ERROR_SUCCESS) {
+                char u8[256] = {};
+                WideCharToMultiByte(CP_UTF8, 0, wname, -1, u8, sizeof u8, nullptr, nullptr);
+                name = std::string(u8) + " (a custom plan)";
+            }
+            out = "power plan " + (name.empty() ? std::string("unknown") : name);
+            LocalFree(scheme);
+        }
+        GUID ov{};
+        if (get_overlay && get_overlay(&ov) == ERROR_SUCCESS) {
+            static const GUID kEfficiency = {0x961cc777, 0x2547, 0x4f9d, {0x81, 0x74, 0x7d, 0x86, 0x18, 0x1b, 0x8a, 0x7a}};
+            static const GUID kPerformance = {0xded574b5, 0x45a0, 0x4f42, {0x87, 0x37, 0x46, 0x34, 0x5c, 0x09, 0xc2, 0x38}};
+            static const GUID kBetterBattery = {0x3af9b8d9, 0x7c97, 0x431d, {0xad, 0x78, 0x34, 0xa8, 0xbf, 0xea, 0x43, 0x9f}};
+            const GUID kBalanced = {};
+            const char* mode = IsEqualGUID(ov, kPerformance)      ? "best performance"
+                               : IsEqualGUID(ov, kBalanced)       ? "balanced"
+                               : IsEqualGUID(ov, kBetterBattery)  ? "better battery"
+                               : IsEqualGUID(ov, kEfficiency)     ? "best power efficiency"
+                                                                  : "other";
+            out += std::string(out.empty() ? "" : ", ") + "power mode " + mode;
+        }
+        FreeLibrary(pp);
+    }
+    SYSTEM_POWER_STATUS ps{};
+    if (GetSystemPowerStatus(&ps)) {
+        const char* src = ps.ACLineStatus == 1 ? "on mains power" : ps.ACLineStatus == 0 ? "ON BATTERY" : "power source unknown";
+        out += std::string(out.empty() ? "" : ", ") + src;
+        if (ps.BatteryFlag != 128 && ps.BatteryFlag != 255 && ps.BatteryLifePercent <= 100) out += ", battery " + std::to_string(ps.BatteryLifePercent) + "%";
+        if (ps.SystemStatusFlag & 1) out += ", BATTERY SAVER ON";
+    }
+    return out.empty() ? std::string("power plan unknown") : out;
+}
+
 Load sample() {
     Load l;
     const uint64_t wall = now_100ns();

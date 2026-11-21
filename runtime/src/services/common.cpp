@@ -101,7 +101,7 @@ uint32_t ServiceEvent::new_handle() const {
 
 void ServiceEvent::signal() {
     st_->signaled = true;
-    kernel::notify_waitable_changed();
+    kernel::notify_waitable_changed(st_.get());
 }
 
 void ServiceEvent::clear() { st_->signaled = false; }

@@ -25,6 +25,7 @@ struct Static {
 const Static& info();               // read on the first call
 std::string features_text(const Static& s);   // "SSE4.2, AVX, AVX2, FMA3, BMI2" (AVX-512 when present)
 std::string summary_line();         // one line for the log: brand, cores, threads, caches, clock, features
+std::string power_line();           // the Windows power plan, power mode and power source ("power plan Balanced, power mode best performance, on mains power")
 
 // Which build of the lifted game code runs ("FMA3", "compatible (no FMA3)"): the game's start-up code says (a string that lives for the
 // whole run); null when it did not.

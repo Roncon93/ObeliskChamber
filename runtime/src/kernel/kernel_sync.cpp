@@ -35,12 +35,43 @@ std::vector<KThread*> g_mutex_waiters;   // waiting for a guest mutex word to be
 std::vector<KThread*> g_cv_waiters;      // waiting on a process-wide key
 std::vector<KThread*> g_addr_waiters;    // WaitForAddress
 
+// [kernel] wake_after_unlock (K2, default false: no gain measured on a 13700K, 2026-11-20; env NXRT_KERNEL_WAKE_AFTER_UNLOCK): a thread woken while g_k is still held runs straight
+// into the held lock and sleeps again until the waker leaves (Orchid's finding). The wakes a Guard's section asks for are collected and made
+// after g_k is released. The woken thread's KThread is kept alive by a reference until then (it may time out and exit meanwhile). Wakes are
+// still made at once when the section is about to sleep with g_k released (block_on_wake, sleep_locked): a deferred wake must not wait for
+// the waker's own wait to end. Host stand-in threads (no shared owner) are woken at once.
+bool wake_after_unlock() {
+    static const bool on = config_get_bool("kernel", "wake_after_unlock", false);
+    return on;
+}
+thread_local std::vector<std::shared_ptr<KThread>> t_pending_wakes;
+thread_local int t_guard_depth = 0;
+std::atomic<uint64_t> g_wakes_deferred{0};
+// [kernel] per_object_wakes (K1, default false: no gain measured on a 13700K, 2026-11-20; env NXRT_KERNEL_PER_OBJECT_WAKES): an event signal wakes only the WaitSynchronization
+// waiters that wait on that event (by its wait_key), not every waiter, which each woke, found nothing ready and slept again. Counted in
+// the gauges kernel.sync_wakes / kernel.sync_wakes_skipped. false: every signal wakes every waiter (as before).
+bool per_object_wakes() {
+    static const bool on = config_get_bool("kernel", "per_object_wakes", false);
+    return on;
+}
+std::atomic<uint64_t> g_sync_wakes{0}, g_sync_wakes_skipped{0};
+void flush_pending_wakes() {
+    if (t_pending_wakes.empty()) return;
+    for (auto& t : t_pending_wakes) WakeConditionVariable(thread_cv(*t));
+    t_pending_wakes.clear();
+}
+
 struct Guard {
     Guard() {
         if (!g_occ_on) AcquireSRWLockExclusive(&g_k);
         else if (!TryAcquireSRWLockExclusive(&g_k)) occ_lock_contended();   // [kernel] occupancy: counts g_k contention
+        ++t_guard_depth;
     }
-    ~Guard() { ReleaseSRWLockExclusive(&g_k); }
+    ~Guard() {
+        --t_guard_depth;
+        ReleaseSRWLockExclusive(&g_k);
+        flush_pending_wakes();
+    }
 };
 
 void remove_from(std::vector<KThread*>& v, KThread* t) { v.erase(std::remove(v.begin(), v.end(), t), v.end()); }
@@ -235,6 +266,15 @@ void stats_report_loop(int64_t seconds) {
                     static_cast<unsigned long long>(s->spun), static_cast<unsigned long long>(s->woken),
                     s->woken ? s->lat_sum * us_per_tick / static_cast<double>(s->woken) : 0.0, s->lat_max * us_per_tick, s->woken ? hist : "-");
         }
+        // K1 / K2 counters over the same window (as the kernel.* gauges show them, as differences here)
+        static uint64_t prev_w = 0, prev_s = 0, prev_d = 0;
+        const uint64_t w = g_sync_wakes.load(std::memory_order_relaxed), sk = g_sync_wakes_skipped.load(std::memory_order_relaxed),
+                       d = g_wakes_deferred.load(std::memory_order_relaxed);
+        NXLOG_I("kernel", "wakes in %llds: event and session signals woke %llu waiters, skipped %llu not waiting on them ([kernel] per_object_wakes = %d); "
+                "%llu wakes made after the kernel lock was released ([kernel] wake_after_unlock = %d)", static_cast<long long>(seconds),
+                static_cast<unsigned long long>(w - prev_w), static_cast<unsigned long long>(sk - prev_s), per_object_wakes() ? 1 : 0,
+                static_cast<unsigned long long>(d - prev_d), wake_after_unlock() ? 1 : 0);
+        prev_w = w; prev_s = sk; prev_d = d;
     }
 }
 
@@ -244,6 +284,7 @@ void stats_report_loop(int64_t seconds) {
 // when that runs out, calls the hook with g_k released. Every caller loops and re-checks its condition, so a wake that comes while the hook
 // runs is not lost.
 void sleep_locked(KThread& t, DWORD ms) {
+    flush_pending_wakes();   // the wakes this section deferred must not wait for this thread's own sleep to end
     void (*fn)() = g_blocked_fn.load(std::memory_order_acquire);
     if (fn && GetCurrentThreadId() == g_blocked_tid.load(std::memory_order_relaxed)) {
         if (!SleepConditionVariableSRW(thread_cv(t), &g_k, std::min<DWORD>(ms, 10), 0)) {
@@ -267,6 +308,7 @@ bool block_on_wake(KThread& t, int64_t timeout_ns, int kind) {
     bool spun = false, slept = false;
     if (g_occ_on) occ_block(t, kind);
     if (spin_me && timeout_ns != 0) {
+        flush_pending_wakes();
         int64_t end = t0 + wt.spin;
         if (timeout_ns > 0 && timeout_ns < 1000000000) end = std::min(end, t0 + timeout_ns * wt.hz / 1000000000);
         ReleaseSRWLockExclusive(&g_k);
@@ -310,18 +352,30 @@ bool block_on_wake(KThread& t, int64_t timeout_ns, int kind) {
     return done(true);
 }
 
+// Wakes t's condition variable: after g_k is released when the caller is inside a Guard and wake_after_unlock is on, else now. g_k held.
+void wake_cv(KThread& t) {
+    if (t_guard_depth > 0 && wake_after_unlock()) {
+        if (std::shared_ptr<KThread> keep = t.self.lock()) {
+            t_pending_wakes.push_back(std::move(keep));
+            g_wakes_deferred.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    WakeConditionVariable(thread_cv(t));
+}
+
 void wake_thread(KThread& t, uint32_t result) {
     t.wait_result = result;                                // before the flag: a spinner reads the result once it sees the flag
     __atomic_store_n(&t.wake, true, __ATOMIC_RELEASE);     // read without g_k by a thread spinning in block_on_wake
     if (g_stats.load(std::memory_order_relaxed)) g_woken_at[&t] = qpc_now();
     if (g_occ_on && t.occ_group == 1) occ_main_woken();
-    WakeConditionVariable(thread_cv(t));
+    wake_cv(t);
 }
 
 void thread_mark_exited(KThread& t) {
     Guard g;
     t.exited = true;
-    for (KThread* w : g_sync_waiters) WakeConditionVariable(thread_cv(*w));
+    for (KThread* w : g_sync_waiters) wake_cv(*w);
 }
 
 void sync_reset() {
@@ -527,12 +581,20 @@ uint32_t wait_synchronization(const uint32_t* handles, int32_t count, int64_t ti
         return -1;
     };
     const int64_t until = timeout_ns <= 0 ? 0 : now_ns() + timeout_ns;
+    std::vector<const void*> keys(objs.size());
+    for (size_t i = 0; i < objs.size(); i++) keys[i] = objs[i]->wait_key();
     Guard g;
     KThread& me = self();
+    me.sync_keys = keys.data();
+    me.sync_nkeys = static_cast<int>(keys.size());
     g_sync_waiters.push_back(&me);
     struct Leave {
         KThread* t;
-        ~Leave() { remove_from(g_sync_waiters, t); }
+        ~Leave() {
+            remove_from(g_sync_waiters, t);
+            t->sync_keys = nullptr;
+            t->sync_nkeys = 0;
+        }
     } leave{&me};
     for (;;) {
         if (me.cancel_sync) {
@@ -574,13 +636,22 @@ uint32_t cancel_synchronization(uint32_t thread_handle) {
     if (!t) return kInvalidHandle;
     Guard g;
     t->cancel_sync = true;
-    if (std::find(g_sync_waiters.begin(), g_sync_waiters.end(), t.get()) != g_sync_waiters.end()) WakeConditionVariable(thread_cv(*t));
+    if (std::find(g_sync_waiters.begin(), g_sync_waiters.end(), t.get()) != g_sync_waiters.end()) wake_cv(*t);
     return kOk;
 }
 
-void notify_waitable_changed() {
+
+void notify_waitable_changed(const void* key) {
+    const bool filter = key && per_object_wakes();
     Guard g;
-    for (KThread* t : g_sync_waiters) WakeConditionVariable(thread_cv(*t));
+    for (KThread* t : g_sync_waiters) {
+        if (filter && t->sync_keys && std::find(t->sync_keys, t->sync_keys + t->sync_nkeys, key) == t->sync_keys + t->sync_nkeys) {
+            g_sync_wakes_skipped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        g_sync_wakes.fetch_add(1, std::memory_order_relaxed);
+        wake_cv(*t);
+    }
 }
 
 bool kernel_names_wanted() {
@@ -618,6 +689,9 @@ GaugeHook gauge_wait_sync("kernel.waiters_sync", [] { return queue_len(g_sync_wa
 GaugeHook gauge_wait_mutex("kernel.waiters_mutex", [] { return queue_len(g_mutex_waiters); });
 GaugeHook gauge_wait_cv("kernel.waiters_cv", [] { return queue_len(g_cv_waiters); });
 GaugeHook gauge_wait_addr("kernel.waiters_addr", [] { return queue_len(g_addr_waiters); });
+GaugeHook gauge_sync_wakes("kernel.sync_wakes", [] { return static_cast<int64_t>(g_sync_wakes.load(std::memory_order_relaxed)); });
+GaugeHook gauge_sync_skipped("kernel.sync_wakes_skipped", [] { return static_cast<int64_t>(g_sync_wakes_skipped.load(std::memory_order_relaxed)); });
+GaugeHook gauge_wakes_deferred("kernel.wakes_after_unlock", [] { return static_cast<int64_t>(g_wakes_deferred.load(std::memory_order_relaxed)); });
 }  // namespace
 
 }  // namespace nxrt::kernel
