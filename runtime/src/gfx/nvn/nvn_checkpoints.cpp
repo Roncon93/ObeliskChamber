@@ -7,6 +7,11 @@
 // pipeline stage, the last marker the GPU reached; each marker is a number into a ring of records here that holds the draw's or dispatch's
 // shader hashes. The report then names the work the GPU had started (top of pipe) but not finished (bottom of pipe), and the records between.
 // A marker per draw costs some GPU and render-thread time, so this is for test builds and reports, not for play.
+//
+// #157 (Radeon 8060S, device lost before the first frame): AMD has no checkpoint extension, but VK_AMD_buffer_marker lets the GPU write a
+// number into a buffer at a pipeline stage. Before every draw and dispatch the replay writes the marker number twice into a small
+// host-visible buffer: at the top of the pipe (the GPU has reached this command) and at the bottom of the pipe (everything before it has
+// finished). After a loss the buffer still holds the last two numbers the GPU wrote, and the same report names the work between them.
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -43,6 +48,11 @@ struct Rec {
 Rec* g_ring = nullptr;
 uint64_t g_seq = 0;                    // render thread
 int g_state = -1;                      // -1 not decided, 0 off, 1 on
+// VK_AMD_buffer_marker: [0] the last marker the GPU reached (top of pipe), [1] the last one all earlier work had finished by (bottom).
+bool g_amd = false;
+VkBuffer g_mbuf = VK_NULL_HANDLE;
+VkDeviceMemory g_mmem = VK_NULL_HANDLE;
+volatile uint32_t* g_mmap = nullptr;
 
 void copy_hash(char (&dst)[20], const char* src) {
     if (!src) { dst[0] = '-'; dst[1] = 0; return; }
@@ -88,8 +98,34 @@ std::string describe(uint64_t seq) {
     return out;
 }
 
+// AMD: the two numbers in the marker buffer. Markers are 32-bit there; the ring's sequence numbers are rebuilt from the latest one recorded.
+std::string report_amd() {
+    std::string out = "  GPU markers ([gfx] gpu_checkpoints, VK_AMD_buffer_marker):\n";
+    const uint32_t top = g_mmap[0], bottom = g_mmap[1];
+    auto full = [](uint32_t m) -> uint64_t {   // the newest sequence number whose low 32 bits are m
+        uint64_t s = (g_seq & ~0xffffffffull) | m;
+        if (s > g_seq && s >= (1ull << 32)) s -= 1ull << 32;
+        return s;
+    };
+    const uint64_t started = top ? full(top) : 0, finished = bottom ? full(bottom) : 0;
+    char b[200];
+    std::snprintf(b, sizeof b, "    markers recorded %llu; last reached (top of pipe) %llu; all work before marker %llu finished (bottom of pipe)\n",
+                  static_cast<unsigned long long>(g_seq), static_cast<unsigned long long>(started), static_cast<unsigned long long>(finished));
+    out += b;
+    if (!started) return out + "    the GPU reached no marker: it failed before the first draw or dispatch\n";
+    out += "    last reached: " + describe(started) + "\n";
+    // the work from the bottom marker up to the top one had been reached by the GPU but not finished when it failed
+    const uint64_t first = std::max(finished ? finished : 1, started > 24 ? started - 24 : 1);
+    if (started >= first) {
+        out += "    in flight (reached, not known finished), oldest first:\n";
+        for (uint64_t s = first; s <= started; ++s) out += "      " + describe(s) + "\n";
+    }
+    return out;
+}
+
 // The device-lost report's section: called once, on the thread that saw the loss.
 std::string report() {
+    if (g_amd && g_mmap) return report_amd();
     if (!g_ring || !vkGetQueueCheckpointDataNV) return "";
     const VkQueue q = device().queue();
     uint32_t n = 0;
@@ -118,6 +154,40 @@ std::string report() {
     return out;
 }
 
+// The marker buffer: 16 bytes of host-visible, coherent memory, so the CPU can still read it after the device is lost.
+bool amd_buffer() {
+    const VkDevice dev = device().device();
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = 16;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(dev, &bi, nullptr, &g_mbuf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(dev, g_mbuf, &mr);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(device().physical(), &mp);
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t ty = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && ty == UINT32_MAX; ++i)   // prefer memory that is not device-local (survives a reset best)
+        if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want &&
+            !(mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            ty = i;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && ty == UINT32_MAX; ++i)
+        if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) ty = i;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = ty;
+    void* p = nullptr;
+    if (ty == UINT32_MAX || vkAllocateMemory(dev, &ai, nullptr, &g_mmem) != VK_SUCCESS || vkBindBufferMemory(dev, g_mbuf, g_mmem, 0) != VK_SUCCESS ||
+        vkMapMemory(dev, g_mmem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
+        NXLOG_W(kTag, "GPU markers: could not make the marker buffer: off");
+        return false;
+    }
+    g_mmap = static_cast<volatile uint32_t*>(p);
+    g_mmap[0] = g_mmap[1] = 0;
+    return true;
+}
+
 bool on() {
     if (g_state < 0) {
         g_state = 0;
@@ -127,8 +197,14 @@ bool on() {
                 g_state = 1;
                 gfx::set_device_lost_extra(&report);
                 NXLOG_I(kTag, "GPU checkpoints on: a marker before every draw and dispatch, named in the device-lost report ([gfx] gpu_checkpoints)");
+            } else if (device().features().buffer_marker_amd && vkCmdWriteBufferMarkerAMD && amd_buffer()) {
+                g_ring = new Rec[kRing];
+                g_amd = true;
+                g_state = 1;
+                gfx::set_device_lost_extra(&report);
+                NXLOG_I(kTag, "GPU markers on (VK_AMD_buffer_marker): the GPU writes a number before every draw and dispatch, named in the device-lost report ([gfx] gpu_checkpoints)");
             } else {
-                NXLOG_W(kTag, "[gfx] gpu_checkpoints is on, but this driver does not offer VK_NV_device_diagnostic_checkpoints (NVIDIA only): off");
+                NXLOG_W(kTag, "[gfx] gpu_checkpoints is on, but this driver offers neither VK_NV_device_diagnostic_checkpoints nor VK_AMD_buffer_marker: off");
             }
         }
     }
@@ -148,6 +224,12 @@ void mark(VkCommandBuffer cb, char kind, const char* a, const char* b, const cha
     r.addr = 0;
     r.nhost = 0;
     r.seq.store(seq, std::memory_order_release);
+    if (g_amd) {
+        const uint32_t m = static_cast<uint32_t>(seq) ? static_cast<uint32_t>(seq) : 1;
+        vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_mbuf, 0, m);
+        vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_mbuf, 4, m);
+        return;
+    }
     vkCmdSetCheckpointNV(cb, reinterpret_cast<const void*>(static_cast<uintptr_t>(seq)));
 }
 

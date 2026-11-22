@@ -779,10 +779,14 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     const bool x_fault = config_get_bool("gfx", "device_fault", true) && add_ext(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &afault);
     // [gfx] gpu_checkpoints (default off; #121): NVIDIA's diagnostic checkpoints, a marker before every draw and dispatch; after a device loss
     // the driver says which marker the GPU last reached, and the report names those shaders. It costs some GPU time: for test builds.
-    bool x_ckpt = false;
+    bool x_ckpt = false, x_amdmark = false;
     if (config_get_bool("gfx", "gpu_checkpoints", false) && has_dext(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
         dev_exts.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
         x_ckpt = true;
+    } else if (config_get_bool("gfx", "gpu_checkpoints", false) && has_dext(VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+        // the AMD way (#157, Radeon 8060S): the GPU writes the marker number into a buffer when it starts and when it finishes each one
+        dev_exts.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+        x_amdmark = true;
     }
     const bool x_dcc = add_ext(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, &adcc);
     const bool x_dce = add_ext(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, &adce);
@@ -892,6 +896,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     features_.buffer_float32_atomic_add = x_af && aaf.shaderBufferFloat32AtomicAdd;
     features_.device_fault = x_fault && afault.deviceFault;
     features_.gpu_checkpoints = x_ckpt;
+    features_.buffer_marker_amd = x_amdmark;
     if (features_.transform_feedback) {   // transformFeedbackQueries is a property: the primitive counters of indirect draws under feedback need it
         VkPhysicalDeviceTransformFeedbackPropertiesEXT tfp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 tfpp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &tfp};
@@ -915,11 +920,11 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     features_.ubo_robustness = (x_prb && aprb.pipelineRobustness) ? (rba2 ? 2 : 1) : 0;   // robustBufferAccess itself is a required feature
     NXLOG_I(kTag, "texture compression on this GPU: BC %s, ASTC-LDR %s, ETC2 %s", features_.bc ? "yes" : "no",
             features_.astc_ldr ? "yes" : "no", features_.etc2 ? "yes" : "no");
-    NXLOG_I(kTag, "features: geometry %d float64 %d int64 %d dualSrc %d logicOp %d multiViewport %d drawParams %d descIndexing %d interlock %d depthClipControl %d customBorder %d hostMemImport %d pushDesc %d uboRobustness %d deviceFault %d gpuCheckpoints %d",
+    NXLOG_I(kTag, "features: geometry %d float64 %d int64 %d dualSrc %d logicOp %d multiViewport %d drawParams %d descIndexing %d interlock %d depthClipControl %d customBorder %d hostMemImport %d pushDesc %d uboRobustness %d deviceFault %d gpuCheckpoints %d amdMarkers %d",
             features_.geometry_shader, features_.shader_float64, features_.shader_int64, features_.dual_src_blend, features_.logic_op,
             features_.multi_viewport, features_.shader_draw_parameters, features_.descriptor_indexing, features_.fragment_shader_interlock,
             features_.depth_clip_control, features_.custom_border_color, features_.external_memory_host, features_.push_descriptor,
-            features_.ubo_robustness, features_.device_fault, features_.gpu_checkpoints);
+            features_.ubo_robustness, features_.device_fault, features_.gpu_checkpoints, features_.buffer_marker_amd);
     if (!features_.shader_float64)
         NXLOG_W(kTag, "this GPU has no 64-bit float math (shaderFloat64): the shaders that use doubles are made 32-bit as they load "
                       "([gfx] lower_float64). If the GPU still hangs, set [setup] intel_shaders = true in ObeliskChamber.ini and press Set up "
