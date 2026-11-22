@@ -12,8 +12,13 @@
 // number into a buffer at a pipeline stage. Before every draw and dispatch the replay writes the marker number twice into a small
 // host-visible buffer: at the top of the pipe (the GPU has reached this command) and at the bottom of the pipe (everything before it has
 // finished). After a loss the buffer still holds the last two numbers the GPU wrote, and the same report names the work between them.
+//
+// #157 again: the GPU reached no marker at all, and the first frame's submit failed at once, so the device was lost in work before the first
+// draw. [gfx] gpu_checkpoints = all also puts a marker before every copy, clear, barrier, query reset, resolve and rendering begin (by
+// wrapping those entry points, on every thread), and the report lists the last submissions with the markers each one carried.
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -36,7 +41,7 @@ constexpr uint64_t kRing = 1u << 16;   // records kept: far more than the draws 
 struct Rec {
     std::atomic<uint64_t> seq{0};      // written last: a reader trusts the record only when this is the marker it looks for
     uint64_t present = 0;              // presents at the time it was recorded
-    char kind = 0;                     // 'd' draw, 'c' dispatch
+    char kind = 0;                     // 'd' draw, 'c' dispatch, 'x' another command (gpu_checkpoints = all; its name in a)
     char a[20] = {}, b[20] = {}, c[20] = {};   // vertex, fragment, geometry (draws) or compute (dispatches) shader hashes
     char what[16] = {};                // ckpt_args: the Vulkan draw call ("draw", "indexed", "indirect", ...)
     uint32_t v[5] = {};                // its counts (see ckpt_args)
@@ -46,8 +51,15 @@ struct Rec {
 };
 
 Rec* g_ring = nullptr;
-uint64_t g_seq = 0;                    // render thread
+std::atomic<uint64_t> g_seq{0};        // render thread, and with gpu_checkpoints = all any thread that records
 int g_state = -1;                      // -1 not decided, 0 off, 1 on
+bool g_all = false;                    // [gfx] gpu_checkpoints = all
+
+// gpu_checkpoints = all: the last submissions (vkQueueSubmit2), each with the newest marker recorded when it was handed over
+struct Sub { uint64_t n = 0, marker = 0; };
+constexpr uint32_t kSubs = 16;
+Sub g_sub[kSubs];
+std::atomic<uint64_t> g_nsub{0};
 // VK_AMD_buffer_marker: [0] the last marker the GPU reached (top of pipe), [1] the last one all earlier work had finished by (bottom).
 bool g_amd = false;
 VkBuffer g_mbuf = VK_NULL_HANDLE;
@@ -75,7 +87,10 @@ std::string describe(uint64_t seq) {
         std::snprintf(b, sizeof b, "marker %llu (no longer recorded)", static_cast<unsigned long long>(seq));
         return b;
     }
-    if (r.kind == 'c')
+    if (r.kind == 'x')
+        std::snprintf(b, sizeof b, "marker %llu: %s (present %llu)", static_cast<unsigned long long>(seq), r.a,
+                      static_cast<unsigned long long>(r.present));
+    else if (r.kind == 'c')
         std::snprintf(b, sizeof b, "marker %llu: dispatch, cs %s (present %llu)", static_cast<unsigned long long>(seq), r.a,
                       static_cast<unsigned long long>(r.present));
     else
@@ -98,21 +113,44 @@ std::string describe(uint64_t seq) {
     return out;
 }
 
+// gpu_checkpoints = all: the last submissions, oldest first, with the markers each carried (from the previous one's newest + 1)
+std::string submissions() {
+    if (!g_all) return "";
+    const uint64_t n = g_nsub.load();
+    if (!n) return "    no vkQueueSubmit2 was made before the loss\n";
+    std::string out = "    submissions (vkQueueSubmit2, " + std::to_string(n) + " in all), the last ones, oldest first:\n";
+    char b[160];
+    for (uint64_t i = n > kSubs ? n - kSubs + 1 : 1; i <= n; ++i) {
+        const Sub& s = g_sub[i % kSubs];
+        const uint64_t prev = i > 1 ? g_sub[(i - 1) % kSubs].marker : 0;
+        if (s.n != i) continue;
+        if (s.marker > prev)
+            std::snprintf(b, sizeof b, "      #%llu: markers %llu..%llu\n", static_cast<unsigned long long>(i), static_cast<unsigned long long>(prev + 1),
+                          static_cast<unsigned long long>(s.marker));
+        else
+            std::snprintf(b, sizeof b, "      #%llu: no marked command\n", static_cast<unsigned long long>(i));
+        out += b;
+    }
+    return out;
+}
+
 // AMD: the two numbers in the marker buffer. Markers are 32-bit there; the ring's sequence numbers are rebuilt from the latest one recorded.
 std::string report_amd() {
     std::string out = "  GPU markers ([gfx] gpu_checkpoints, VK_AMD_buffer_marker):\n";
     const uint32_t top = g_mmap[0], bottom = g_mmap[1];
     auto full = [](uint32_t m) -> uint64_t {   // the newest sequence number whose low 32 bits are m
-        uint64_t s = (g_seq & ~0xffffffffull) | m;
-        if (s > g_seq && s >= (1ull << 32)) s -= 1ull << 32;
+        const uint64_t cur = g_seq.load();
+        uint64_t s = (cur & ~0xffffffffull) | m;
+        if (s > cur && s >= (1ull << 32)) s -= 1ull << 32;
         return s;
     };
     const uint64_t started = top ? full(top) : 0, finished = bottom ? full(bottom) : 0;
     char b[200];
     std::snprintf(b, sizeof b, "    markers recorded %llu; last reached (top of pipe) %llu; all work before marker %llu finished (bottom of pipe)\n",
-                  static_cast<unsigned long long>(g_seq), static_cast<unsigned long long>(started), static_cast<unsigned long long>(finished));
+                  static_cast<unsigned long long>(g_seq.load()), static_cast<unsigned long long>(started), static_cast<unsigned long long>(finished));
     out += b;
-    if (!started) return out + "    the GPU reached no marker: it failed before the first draw or dispatch\n";
+    if (!started) return out + (g_all ? "    the GPU reached no marker: it failed before the first command marked (copies, clears, barriers, draws, dispatches)\n"
+                                      : "    the GPU reached no marker: it failed before the first draw or dispatch\n") + submissions();
     out += "    last reached: " + describe(started) + "\n";
     // the work from the bottom marker up to the top one had been reached by the GPU but not finished when it failed
     const uint64_t first = std::max(finished ? finished : 1, started > 24 ? started - 24 : 1);
@@ -120,7 +158,7 @@ std::string report_amd() {
         out += "    in flight (reached, not known finished), oldest first:\n";
         for (uint64_t s = first; s <= started; ++s) out += "      " + describe(s) + "\n";
     }
-    return out;
+    return out + submissions();
 }
 
 // The device-lost report's section: called once, on the thread that saw the loss.
@@ -151,7 +189,7 @@ std::string report() {
         out += "    in flight (started, not finished):\n";
         for (uint64_t s = first; s <= started; ++s) out += "      " + describe(s) + "\n";
     }
-    return out;
+    return out + submissions();
 }
 
 // The marker buffer: 16 bytes of host-visible, coherent memory, so the CPU can still read it after the device is lost.
@@ -192,18 +230,23 @@ bool amd_buffer() {
 bool on() {
     if (g_state < 0) {
         g_state = 0;
-        if (nxrt::config_get_bool("gfx", "gpu_checkpoints", false)) {
+        std::string v = nxrt::config_get_str("gfx", "gpu_checkpoints", "false");
+        for (char& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        g_all = v == "all";
+        if (g_all || v == "1" || v == "true" || v == "on" || v == "yes") {
             if (device().features().gpu_checkpoints && vkCmdSetCheckpointNV && vkGetQueueCheckpointDataNV) {
                 g_ring = new Rec[kRing];
                 g_state = 1;
                 gfx::set_device_lost_extra(&report);
-                NXLOG_I(kTag, "GPU checkpoints on: a marker before every draw and dispatch, named in the device-lost report ([gfx] gpu_checkpoints)");
+                NXLOG_I(kTag, "GPU checkpoints on: a marker before every draw and dispatch%s, named in the device-lost report ([gfx] gpu_checkpoints)",
+                        g_all ? " and every copy, clear, barrier and query reset" : "");
             } else if (device().features().buffer_marker_amd && vkCmdWriteBufferMarkerAMD && amd_buffer()) {
                 g_ring = new Rec[kRing];
                 g_amd = true;
                 g_state = 1;
                 gfx::set_device_lost_extra(&report);
-                NXLOG_I(kTag, "GPU markers on (VK_AMD_buffer_marker): the GPU writes a number before every draw and dispatch, named in the device-lost report ([gfx] gpu_checkpoints)");
+                NXLOG_I(kTag, "GPU markers on (VK_AMD_buffer_marker): the GPU writes a number before every draw and dispatch%s, named in the device-lost report ([gfx] gpu_checkpoints)",
+                        g_all ? " and every copy, clear, barrier and query reset" : "");
             } else {
                 NXLOG_W(kTag, "[gfx] gpu_checkpoints is on, but this driver offers neither VK_NV_device_diagnostic_checkpoints nor VK_AMD_buffer_marker: off");
             }
@@ -213,7 +256,7 @@ bool on() {
 }
 
 void mark(VkCommandBuffer cb, char kind, const char* a, const char* b, const char* c) {
-    const uint64_t seq = ++g_seq;
+    const uint64_t seq = g_seq.fetch_add(1) + 1;
     Rec& r = g_ring[seq % kRing];
     r.seq.store(0, std::memory_order_relaxed);
     r.kind = kind;
@@ -234,7 +277,45 @@ void mark(VkCommandBuffer cb, char kind, const char* a, const char* b, const cha
     vkCmdSetCheckpointNV(cb, reinterpret_cast<const void*>(static_cast<uintptr_t>(seq)));
 }
 
+// ---- gpu_checkpoints = all: wrappers over the other recording entry points (installed once, after the recording queue's own) ----
+#define CKPT_ALL_LIST(X)                                                                                                                 \
+    X(vkCmdCopyBuffer) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage2)  \
+    X(vkCmdCopyImageToBuffer2) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdClearAttachments) X(vkCmdFillBuffer)         \
+    X(vkCmdUpdateBuffer) X(vkCmdResolveImage) X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2) X(vkCmdResetQueryPool)                    \
+    X(vkCmdBeginRendering) X(vkCmdCopyQueryPoolResults) X(vkCmdBeginQuery) X(vkCmdEndQuery)
+
+template <auto* Prev, const char* Name, class Sig> struct Mk;
+template <auto* Prev, const char* Name, class... A> struct Mk<Prev, Name, void(VKAPI_PTR*)(VkCommandBuffer, A...)> {
+    static void VKAPI_PTR wrap(VkCommandBuffer cb, A... a) {
+        mark(cb, 'x', Name + 5, nullptr, nullptr);   // without "vkCmd"
+        (*Prev)(cb, a...);
+    }
+};
+
+#define CKPT_DECL(name) PFN_##name prev_##name = nullptr; constexpr char kName_##name[] = #name;
+CKPT_ALL_LIST(CKPT_DECL)
+#undef CKPT_DECL
+
+PFN_vkQueueSubmit2 prev_vkQueueSubmit2 = nullptr;
+VkResult VKAPI_PTR submit2_wrap(VkQueue q, uint32_t n, const VkSubmitInfo2* si, VkFence f) {
+    const uint64_t i = g_nsub.fetch_add(1) + 1;
+    Sub& s = g_sub[i % kSubs];
+    s.marker = g_seq.load();
+    s.n = i;
+    return prev_vkQueueSubmit2(q, n, si, f);
+}
+
 }  // namespace
+
+void ckpt_install() {
+    static bool done = false;
+    if (done || !on() || !g_all) return;
+    done = true;
+#define CKPT_WRAP(name) if (name) { prev_##name = name; name = &Mk<&prev_##name, kName_##name, PFN_##name>::wrap; }
+    CKPT_ALL_LIST(CKPT_WRAP)
+#undef CKPT_WRAP
+    if (vkQueueSubmit2) { prev_vkQueueSubmit2 = vkQueueSubmit2; vkQueueSubmit2 = &submit2_wrap; }
+}
 
 void ckpt_draw(VkCommandBuffer cb, const char* vs, const char* fs, const char* gs) {
     if (on()) mark(cb, 'd', vs, fs, gs);
@@ -245,10 +326,11 @@ void ckpt_dispatch(VkCommandBuffer cb, const char* cs) {
 }
 
 void ckpt_args(const char* what, uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3, uint32_t v4, uint64_t addr, const void* host, uint32_t nhost) {
-    if (g_state != 1 || !g_seq) return;
-    Rec& r = g_ring[g_seq % kRing];
+    const uint64_t cur = g_seq.load();
+    if (g_state != 1 || !cur) return;
+    Rec& r = g_ring[cur % kRing];
     const uint64_t seq = r.seq.load(std::memory_order_relaxed);
-    if (seq != g_seq) return;
+    if (seq != cur) return;
     r.seq.store(0, std::memory_order_relaxed);
     std::strncpy(r.what, what, sizeof r.what - 1);
     r.what[sizeof r.what - 1] = 0;

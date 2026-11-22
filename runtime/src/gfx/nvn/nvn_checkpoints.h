@@ -7,6 +7,9 @@ namespace nxrt::nvn::be::gpu {
 // No-ops unless [gfx] gpu_checkpoints is on and the driver has VK_NV_device_diagnostic_checkpoints or VK_AMD_buffer_marker. Shader hashes
 // may be null.
 void ckpt_draw(VkCommandBuffer cb, const char* vs, const char* fs, const char* gs);
+// [gfx] gpu_checkpoints = all: wraps the copy, clear, barrier and query entry points (and vkQueueSubmit2) so they get markers too. Call once,
+// after the recording queue's wrappers are in (cmdq::install). A no-op otherwise.
+void ckpt_install();
 void ckpt_dispatch(VkCommandBuffer cb, const char* cs);
 // The draw call the last ckpt_draw marked: its name and counts (draw: vertices, instances, first vertex, first instance; indexed: indices,
 // instances, first index, vertex offset, first instance; indirect: draw count, stride, max count, index type; xfb: stride, slot) and, for an

@@ -41,6 +41,7 @@
 #include "nvn_cmdq.h"
 #include "nvn_residency.h"
 #include "nvn_gpu_internal.h"
+#include "nvn_checkpoints.h"
 #include "nvn_impl.h"
 #include "nvn_pipeline.h"
 #include "nvn_present_pass.h"
@@ -1750,6 +1751,7 @@ bool bring_up(gfx::Device& dev, gfx::Renderer* rend, FrameLimiter* limiter, bool
     (void)report_registered;
     register_counter_gauges();
     cmdq::install();      // [nvn] replay_threads: before the render thread records anything
+    ckpt_install();       // [gfx] gpu_checkpoints = all: on top of the queue's wrappers, so markers stay in order with the commands
     gp->th = std::thread(render_loop);
     // wait for the thread id to be published
     for (int i = 0; i < 1000 && gp->tid == std::thread::id(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));

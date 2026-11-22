@@ -191,7 +191,7 @@ void do_sync() {
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetLineWidth) X(vkCmdSetFrontFace) X(vkCmdSetDepthWriteEnable)  \
     X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetDepthBounds) X(vkCmdSetDepthBiasEnable) \
     X(vkCmdSetDepthBias) X(vkCmdSetCullMode) X(vkCmdCopyQueryPoolResults) X(vkCmdFillBuffer) X(vkCmdEndDebugUtilsLabelEXT)       \
-    X(vkCmdSetCheckpointNV)
+    X(vkCmdSetCheckpointNV) X(vkCmdWriteBufferMarkerAMD)
 
 // Calls with arrays or structures behind pointers (deep copies, below).
 #define CMDQ_DEEP_LIST(X)                                                                                                                \
