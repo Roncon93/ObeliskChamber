@@ -1354,8 +1354,8 @@ bool xres_on() {
     return on;
 }
 TexResolved resolve_handle(uint64_t handle) {
-    const TexturePool* tp = S.tpool;
-    const SamplerPool* sp = S.spool;
+    const TexturePool* tp = S.tpool.get();
+    const SamplerPool* sp = S.spool.get();
     const uint32_t tid = handle_texture_id(handle), sid = handle_sampler_id(handle);
     if (!xres_on() || !tp || !sp || !tp->stamps || !sp->stamps || static_cast<int>(tid) >= tp->count || static_cast<int>(sid) >= sp->count)
         return resolve_handle_locked(handle, nullptr, nullptr);
