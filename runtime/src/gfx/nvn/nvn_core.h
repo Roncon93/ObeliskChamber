@@ -187,9 +187,16 @@ struct Texture : Obj {
     bool sparse_all = true;
 };
 
+// [nvn] resolve_cache: each texture and sampler pool has a number of its own (an address can be used again by a later pool) and one
+// counter per id that every registration of that id raises, under the pool's lock. A reader that kept what an id held, with the counter it
+// saw under the lock, knows without the lock that the id still holds the same while the counter is unchanged.
+inline std::atomic<uint32_t> g_pool_uid{1};
+
 struct TexturePool : Obj {
     static constexpr Kind kKind = Kind::TexturePool;
     TexturePool() : Obj(kKind) {}
+    uint32_t uid = g_pool_uid.fetch_add(1, std::memory_order_relaxed);
+    std::unique_ptr<std::atomic<uint32_t>[]> stamps;   // one per id (count of them), made with the entries
     struct Entry {
         Ref<Texture> tex;
         TextureViewInfo view;
@@ -210,6 +217,8 @@ struct TexturePool : Obj {
 struct SamplerPool : Obj {
     static constexpr Kind kKind = Kind::SamplerPool;
     SamplerPool() : Obj(kKind) {}
+    uint32_t uid = g_pool_uid.fetch_add(1, std::memory_order_relaxed);
+    std::unique_ptr<std::atomic<uint32_t>[]> stamps;   // as TexturePool's
     MemoryPool* mem = nullptr;
     int64_t offset = 0;
     int count = 0;
@@ -224,6 +233,7 @@ struct SamplerPool : Obj {
 template <class Pool>
 inline void pool_note_change(Pool& p, int id) {
     ++p.version;
+    if (p.stamps && id >= 0 && id < p.count) p.stamps[static_cast<size_t>(id)].fetch_add(1, std::memory_order_release);
     p.changes.push_back(static_cast<uint32_t>(id));
     if (p.changes.size() > 8192) p.changes.erase(p.changes.begin(), p.changes.begin() + 4096);
 }

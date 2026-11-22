@@ -543,7 +543,7 @@ std::atomic<bool> g_trace_req{false};   // backend_trace_next_frame(): trace the
 enum RsZone : int { kRsHead, kRsPrep, kRsFb, kRsPass, kRsPipe, kRsDyn, kRsSets, kRsVb, kRsCall, kRsOut, kRsDispatch, kRsAll, kRsAlloc, kRsN };
 struct RStats {
     uint64_t cyc[kRsN] = {};
-    uint64_t draws = 0, draws_desc = 0, draws_ubo = 0, draws_pipe = 0, sets = 0, set_hits = 0, set_writes = 0, res_tex = 0, res_img = 0, res_memo = 0;
+    uint64_t draws = 0, draws_desc = 0, draws_ubo = 0, draws_pipe = 0, sets = 0, set_hits = 0, set_writes = 0, res_tex = 0, res_img = 0, res_memo = 0, res_xhit = 0;
     uint64_t binds = 0, binds_same = 0, layouts = 0, keys = 0, dispatches = 0;
     uint64_t miss_first = 0, miss_uboofs = 0, miss_ubo = 0, miss_tex = 0, miss_other = 0;   // set cache misses by what differs from the last set of that layout
     uint64_t out_fast = 0, out_full_all = 0, out_full_gen = 0, out_full_unmemo = 0, out_prog = 0, out_prog_marked = 0;   // out_draw_bindings passes
@@ -556,6 +556,7 @@ uint64_t g_rs_t = 0;   // TSC at the last phase mark
 // [nvn] rt_check = 1 (debug, default 0): every memo answer of the rt changes (resolve_memo, out_memo; pool_cache in nvn_objects.cpp, the
 // view and sampler caches in nvn_gpu_texture.cpp) is compared with the answer computed without it. A mismatch is logged (nvn.rtcheck,
 // first 20); with replay_stats the stats line counts the checks. No mismatch = the same Vulkan commands as without the memos.
+bool xres_on();
 bool rt_check() {
     static const bool on = nxrt::config_get_bool("nvn", "rt_check", false);
     return on;
@@ -645,6 +646,7 @@ void rs_report() {
             "replay_stats off too (the session line) before comparing these totals with a frame budget",
             s.reads * pf, s.draws ? static_cast<double>(s.reads) / static_cast<double>(s.draws) : 0.0, rs_read_cycles(), own_ms,
             std::max(0.0, fms(kRsAll) - own_ms));
+    NXLOG_I("nvn.rstats", "resolve_cache %d: %.0f of the %.0f texture resolves a frame answered from the cache", xres_on() ? 1 : 0, s.res_xhit * pf, s.res_tex * pf);
     NXLOG_I("nvn.rstats", "out_prog_dirty %d: out passes/frame: short %.0f, full %.0f (program bind or reset %.0f, generation %.0f, unmemoised %.0f) | "
             "program binds/frame %.0f, slots marked by them %.0f",
             g_out_prog, s.out_fast * pf, static_cast<double>(s.out_full_all + s.out_full_gen + s.out_full_unmemo) * pf, s.out_full_all * pf,
@@ -1234,6 +1236,7 @@ ResMemo* memo_for(const BindingDesc& d) {
 
 TexResolved resolve_texture_raw(const BindingDesc& d);
 TexResolved resolve_image_raw(const BindingDesc& d);
+TexResolved resolve_handle(uint64_t handle);
 bool same_resolved(const TexResolved& a, const TexResolved& b) {
     if (a.tex != b.tex || a.has_view != b.has_view || a.has_sampler != b.has_sampler || a.sid0 != b.sid0) return false;
     if (a.has_sampler && !(a.smp == b.smp)) return false;
@@ -1294,7 +1297,6 @@ bool reserved_sampler_on() {
 
 TexResolved resolve_texture_raw(const BindingDesc& d) {
     ++g_rs.res_tex;
-    TexResolved r;
     const DescriptorBinding& b = d.shader->refl.bindings[d.index];
     uint64_t handle = 0;
     if (b.nvn.source == NvnSource::SamplerBinding) {
@@ -1306,6 +1308,13 @@ TexResolved resolve_texture_raw(const BindingDesc& d) {
         const int idx = b.nvn.index;
         if (idx >= 0 && idx < 16) handle = S.img[d.nvn_stage][idx];
     }
+    return resolve_handle(handle);
+}
+
+// What a texture handle names in the bound pools: the texture and its view from the texture pool, the sampler from the sampler pool,
+// each read under its pool's lock. `ts` / `ss`: the ids' registration counters as they stood under those locks (0 without a counter).
+TexResolved resolve_handle_locked(uint64_t handle, uint32_t* ts, uint32_t* ss) {
+    TexResolved r;
     const uint32_t tid = handle_texture_id(handle), sid = handle_sampler_id(handle);
     r.sid0 = sid == 0;
     if (S.tpool && static_cast<int>(tid) < S.tpool->count) {
@@ -1316,6 +1325,7 @@ TexResolved resolve_texture_raw(const BindingDesc& d) {
             r.view = e.view;
             r.has_view = e.has_view;
         }
+        if (ts && S.tpool->stamps) *ts = S.tpool->stamps[tid].load(std::memory_order_acquire);
     }
     if (S.spool && static_cast<int>(sid) < S.spool->count) {
         std::shared_lock<std::shared_mutex> lk(S.spool->lock);
@@ -1323,8 +1333,45 @@ TexResolved resolve_texture_raw(const BindingDesc& d) {
             r.smp = S.spool->entries[sid];
             r.has_sampler = true;
         }
+        if (ss && S.spool->stamps) *ss = S.spool->stamps[sid].load(std::memory_order_acquire);
     }
     return r;
+}
+
+// [nvn] resolve_cache (default off until measured): what a handle resolved to is kept across draws. The memo above saves the repeats
+// inside one draw; the next draw resolved every binding again, two pool locks and a copy each, about 11,000 times a frame in a crowd
+// (character draws bind more textures). An entry is good while both ids' registration counters are what they were under the locks when
+// it was filled (nvn_core.h), so a hit takes no lock: two loads and a compare. Only the render thread resolves (as g_memo).
+struct XRes {
+    uint64_t handle = 0;
+    uint32_t tuid = 0, suid = 0, ts = 0, ss = 0;   // tuid 0: empty
+    TexResolved r;
+};
+constexpr size_t kXResBits = 10;
+std::vector<XRes> g_xres;
+bool xres_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "resolve_cache", false);
+    return on;
+}
+TexResolved resolve_handle(uint64_t handle) {
+    const TexturePool* tp = S.tpool;
+    const SamplerPool* sp = S.spool;
+    const uint32_t tid = handle_texture_id(handle), sid = handle_sampler_id(handle);
+    if (!xres_on() || !tp || !sp || !tp->stamps || !sp->stamps || static_cast<int>(tid) >= tp->count || static_cast<int>(sid) >= sp->count)
+        return resolve_handle_locked(handle, nullptr, nullptr);
+    if (g_xres.empty()) g_xres.resize(size_t(1) << kXResBits);
+    XRes& c = g_xres[static_cast<size_t>((handle * 0x9e3779b97f4a7c15ull) >> (64 - kXResBits))];
+    if (c.handle == handle && c.tuid == tp->uid && c.suid == sp->uid && c.ts == tp->stamps[tid].load(std::memory_order_acquire) &&
+        c.ss == sp->stamps[sid].load(std::memory_order_acquire)) {
+        ++g_rs.res_xhit;
+        if (rt_check()) chk(same_resolved(c.r, resolve_handle_locked(handle, nullptr, nullptr)), "resolve_cache");
+        return c.r;
+    }
+    c.r = resolve_handle_locked(handle, &c.ts, &c.ss);
+    c.handle = handle;
+    c.tuid = tp->uid;
+    c.suid = sp->uid;
+    return c.r;
 }
 
 ViewRequest make_request(const DescriptorBinding& b, const TexResolved& r) {

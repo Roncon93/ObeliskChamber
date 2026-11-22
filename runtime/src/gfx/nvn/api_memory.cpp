@@ -378,6 +378,7 @@ NVNboolean nvnTexturePoolInitialize(NVNtexturePool* pool, const NVNmemoryPool* m
     tp->offset = offset;
     tp->count = count;
     tp->entries.resize(static_cast<size_t>(count));
+    tp->stamps.reset(new std::atomic<uint32_t>[static_cast<size_t>(count)]());
     owner_slot_set(pool, reinterpret_cast<uint64_t>(memory));
     bind_guest(pool, tp);
     g_texture_pools.add(1);
@@ -460,6 +461,7 @@ NVNboolean nvnSamplerPoolInitialize(NVNsamplerPool* pool, const NVNmemoryPool* m
     sp->count = count;
     sp->entries.resize(static_cast<size_t>(count));
     sp->used.resize(static_cast<size_t>(count), 0);
+    sp->stamps.reset(new std::atomic<uint32_t>[static_cast<size_t>(count)]());
     owner_slot_set(pool, reinterpret_cast<uint64_t>(memory));
     bind_guest(pool, sp);
     g_sampler_pools.add(1);
