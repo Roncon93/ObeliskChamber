@@ -83,6 +83,7 @@ struct Job {
     int state = 0;                          // 0 queued, 1 building, 2 done, 3 taken over by a draw (the worker skips it)
     bool in_queue = false, promoted = false;
     VkPipeline pipe = VK_NULL_HANDLE;
+    std::chrono::steady_clock::time_point built_at{};   // when pipe was built (prewarm_release_s)
     std::shared_ptr<PipeUpgrade> up;        // a draw linked the key from parts meanwhile: the whole pipeline goes here and replaces that one
 };
 
@@ -416,6 +417,7 @@ void worker_main() {
                 j->up.reset();
             } else {
                 j->pipe = p;
+                j->built_at = std::chrono::steady_clock::now();
             }
         }
         g_cv.notify_all();
@@ -556,11 +558,60 @@ void log_summary_locked() {
     last = now;
 }
 
+// [nvn] prewarm_release_s: a pipeline built ahead that no draw has taken for this many seconds is destroyed (0 = never; auto: 180 with
+// memory limits scaled to the PC, else never). The driver keeps each built pipeline's code in its own memory (on NVIDIA a 1 GiB private
+// allocation per arena; the laptop's census had 991 MiB of one in RAM after the boot prewarm built ~2500 pipelines, of which ~130 were
+// drawn). The pipeline cache and the driver's disk cache keep the code, so a draw that wants one later builds it in about 0.3 ms.
+int64_t release_after_s() {
+    static const int64_t s = [] {
+        const std::string v = config_get_str("nvn", "prewarm_release_s", "auto");
+        const bool autom = v == "auto" || v.empty();
+        const int64_t r = autom ? (mem::limits_scaled() ? 180 : 0) : std::max<int64_t>(0, config_get_int("nvn", "prewarm_release_s", 0));
+        NXLOG_I(kTag, "prewarm: pipelines built ahead and not drawn are %s ([nvn] prewarm_release_s = %s%s)",
+                r ? ("released after " + std::to_string(r) + " s").c_str() : "kept", v.c_str(),
+                autom ? (mem::limits_scaled() ? ", limits scaled" : ", limits not scaled") : "");
+        return r;
+    }();
+    return s;
+}
+
+struct ReleaseStats { uint64_t released = 0, rounds = 0; } g_release;
+
+// Called on the saver thread with g_mu held; destroys outside it.
+void release_unused_locked(std::unique_lock<std::mutex>& lk) {
+    const int64_t after = release_after_s();
+    if (!after) return;
+    const auto cut = std::chrono::steady_clock::now() - std::chrono::seconds(after);
+    std::vector<std::shared_ptr<Job>> old;
+    for (const auto& [d, vec] : g_jobs)
+        for (const auto& j : vec)
+            if (j->state == 2 && j->pipe && !j->up && j->built_at < cut) old.push_back(j);
+    if (old.empty()) return;
+    std::vector<VkPipeline> pipes;
+    pipes.reserve(old.size());
+    for (const auto& j : old) {                       // out of g_jobs: a draw that wants the key builds it (from the caches)
+        pipes.push_back(j->pipe);
+        j->pipe = VK_NULL_HANDLE;
+        erase_job_locked(j);
+    }
+    g_release.released += pipes.size();
+    ++g_release.rounds;
+    const uint64_t total = g_release.released;
+    lk.unlock();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (VkPipeline p : pipes) vkDestroyPipeline(vkdev(), p, nullptr);
+    const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    NXLOG_I(kTag, "prewarm: released %zu pipelines built ahead and not drawn for %lld s (%llu so far) in %.1f ms ([nvn] prewarm_release_s)", pipes.size(),
+            static_cast<long long>(after), static_cast<unsigned long long>(total), ms);
+    lk.lock();
+}
+
 void saver_main() {
     log_set_thread_name("nvn-cache-save");
     std::unique_lock<std::mutex> lk(g_mu);
     uint64_t logged = 0;
     auto next_summary = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto next_release = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (!g_stop) {
         g_cv.wait_for(lk, std::chrono::seconds(2), [] { return g_stop; });
         if (g_stop) break;
@@ -578,6 +629,11 @@ void saver_main() {
         }
         gpl_progress_log();
         compute_progress_log();
+        if (std::chrono::steady_clock::now() >= next_release) {
+            next_release = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            release_unused_locked(lk);
+            if (g_stop) break;
+        }
         if (std::chrono::steady_clock::now() >= next_summary) {
             next_summary += std::chrono::seconds(30);
             log_summary_locked();
