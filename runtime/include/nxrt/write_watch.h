@@ -129,6 +129,7 @@ bool all_valid_or_armed(const Region* r, uint64_t first, uint64_t count, const s
 uint64_t guard_faults();   // accesses that hit a guarded page (statistics)
 
 uint64_t faults();     // write faults handled so far (statistics)
+uint64_t coalesced_pages();   // pages released ahead of their write by [memory] write_watch_coalesce (statistics)
 uint64_t fault_waits(); // rounds a fault spent waiting for another thread's release of the same page (statistics; stays 0 for foreign faults)
 
 }  // namespace nxrt::mem::ww

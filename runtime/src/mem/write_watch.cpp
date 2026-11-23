@@ -274,6 +274,55 @@ bool release_page(Region* r, uint64_t page) {
     }
 }
 
+// [memory] write_watch_coalesce (default on): a thread writing through a region page after page (a copy into a pool, a buffer filled in
+// order) faults once per 4 KiB page. From the third fault in a row on neighbouring pages of one region, the armed pages after the faulting one
+// are released with it, 8 (from the fifth, 16) at a time, in one VirtualProtect. Those pages count as written: their owner copies them again even if the
+// write stops short, which costs a copy of at most 16 pages per run. A run stops at the first page that is not armed here, is guarded, lies
+// in another region too (its protection is shared) or in an import freeze. fefw-recomp #119 (metrist38): 23 % fewer write faults in Dagsion.
+std::atomic<uint64_t> g_coalesced{0};   // pages released ahead of their write (statistics)
+std::atomic<bool> g_coalesce{false};     // read at each region_create (the tests switch it)
+bool coalesce_on() { return g_coalesce.load(std::memory_order_relaxed); }
+// The pages after `page` in r, released with it: at most `want`. The caller holds the region's lock shared (arm, freezes and region
+// destruction take g_transitions exclusive, so none of them runs meanwhile).
+void release_ahead(Region* r, uint64_t page, uint64_t want) {
+    const uint64_t first = page + 1;
+    uint64_t end = std::min<uint64_t>(first + want, r->npages);
+    if (first >= end) return;
+    const uint64_t lo = r->base + first * kPage;
+    for (RegionCursor cursor; Region* o = cursor.next();) {      // a page in two regions: its protection is not this region's alone
+        if (o == r) continue;
+        const uint64_t olo = o->base, ohi = o->base + o->npages * kPage;
+        if (ohi <= lo || olo >= r->base + end * kPage) continue;
+        if (olo <= lo) return;
+        end = std::min<uint64_t>(end, (olo - r->base) / kPage);
+    }
+    if (freeze_overlaps(lo, r->base + end * kPage)) return;
+    uint64_t q = first;
+    for (; q < end; ++q) {
+        const uint64_t b = bit(q), w = q >> 6;
+        if (test(r->guard.get(), q) || !(r->prot[w].load(std::memory_order_acquire) & b)) break;
+        r->releasing[q].fetch_add(1, std::memory_order_seq_cst);
+        if (!(r->prot[w].fetch_and(~b, std::memory_order_acq_rel) & b)) {      // another thread's fault took it: it releases it
+            r->releasing[q].fetch_sub(1, std::memory_order_seq_cst);
+            break;
+        }
+        r->valid[w].fetch_and(~b, std::memory_order_acq_rel);
+        r->written[w].fetch_or(b, std::memory_order_acq_rel);
+    }
+    if (q == first) return;
+    DWORD was = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(lo), static_cast<SIZE_T>((q - first) * kPage), PAGE_READWRITE, &was)) {
+        for (uint64_t k = first; k < q; ++k) {      // still read-only: armed again (their written bits only cost a copy)
+            r->prot[k >> 6].fetch_or(bit(k), std::memory_order_acq_rel);
+            r->releasing[k].fetch_sub(1, std::memory_order_seq_cst);
+        }
+        return;
+    }
+    for (uint64_t k = first; k < q; ++k) r->releasing[k].fetch_sub(1, std::memory_order_seq_cst);
+    r->any_written.store(true, std::memory_order_release);
+    g_coalesced.fetch_add(q - first, std::memory_order_relaxed);
+}
+
 // [diag] ww_stats (env NXRT_DIAG_WW_STATS=1): faults per region and per 64 KiB block, the 10 busiest blocks logged every 10 s.
 std::mutex g_fs_lock;
 std::map<std::pair<uint64_t, uint64_t>, uint64_t> g_fs_blocks;   // (region base, 64 KiB block address) -> faults
@@ -420,7 +469,21 @@ retry:
             if (test(r->guard.get(), pg)) { guarded_now = true; continue; }
             if (pass == 0 && !test(r->prot.get(), pg)) continue;
             const bool mine = release_page(r, pg);
-            if (mine) fault_stat(r, addr);
+            if (mine) {
+                fault_stat(r, addr);
+                if (pass == 0 && coalesce_on()) {      // neighbouring pages written in order: release the next ones with this one
+                    thread_local const Region* t_r = nullptr;
+                    thread_local uint64_t t_pg = 0, t_run = 0;
+                    t_run = t_r == r && pg == t_pg + 1 ? t_run + 1 : 1;
+                    t_r = r;
+                    t_pg = pg;
+                    if (t_run >= 3) {
+                        const uint64_t n = t_run >= 5 ? 16 : 8;
+                        release_ahead(r, pg, n);
+                        t_pg = pg + n;      // a write that goes on past the released pages faults on the next one: still in order
+                    }
+                }
+            }
             ours |= mine;
         }
     }
@@ -504,6 +567,7 @@ Region* region_create(uint64_t addr, uint64_t size, const char* owner) {
     if (!size || !heap_exists()) return nullptr;
     const uint64_t start = addr & ~(kPage - 1), end = (addr + size + kPage - 1) & ~(kPage - 1);
     if (start < kHeapBase || end > kHeapBase + heap_reserved()) return nullptr;
+    g_coalesce.store(config_get_bool("memory", "write_watch_coalesce", true), std::memory_order_relaxed);
     auto r = std::make_unique<Region>();
     r->owner = owner ? owner : "unspecified";
     r->base = start;
@@ -980,6 +1044,7 @@ void forget(uint64_t addr, uint64_t size, bool ban) {
 void ban_section(uint64_t offset, uint64_t size) { forget(kHeapBase + offset, size, true); }
 
 uint64_t faults() { return g_faults.load(std::memory_order_relaxed); }
+uint64_t coalesced_pages() { return g_coalesced.load(std::memory_order_relaxed); }
 uint64_t fault_waits() { return g_waits.load(std::memory_order_relaxed); }
 
 }  // namespace nxrt::mem::ww

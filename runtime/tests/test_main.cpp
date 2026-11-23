@@ -35,6 +35,8 @@ void skip(const char* why) {
 int main(int argc, char** argv) {
     using namespace nxtest;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // The write-watch tests count faults page by page: no [memory] write_watch_coalesce unless a test turns it on.
+    if (!std::getenv("NXRT_MEMORY_WRITE_WATCH_COALESCE")) _putenv_s("NXRT_MEMORY_WRITE_WATCH_COALESCE", "0");
 #ifdef NXRT_TEST_GAME_REGISTER
     NXRT_TEST_GAME_REGISTER();
 #endif

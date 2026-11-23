@@ -73,6 +73,52 @@ NXTEST(arm_then_write_releases_the_page) {
     teardown(r);
 }
 
+// [memory] write_watch_coalesce: the third write in a row on neighbouring pages releases the next 8 pages with its own; they count as
+// written, a page outside the region and a guarded page stop a run, and with the setting off every page faults.
+NXTEST(sequential_writes_release_pages_ahead) {
+    _putenv_s("NXRT_MEMORY_WRITE_WATCH_COALESCE", "1");
+    ww::Region* r = setup();
+    _putenv_s("NXRT_MEMORY_WRITE_WATCH_COALESCE", "0");
+    REQUIRE(r != nullptr);
+    CHECK(ww::arm(r, 0, kPages));
+    const uint64_t f0 = ww::faults(), c0 = ww::coalesced_pages();
+    auto put = [](uint64_t page) { *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase + page * kPg + 16) = static_cast<uint32_t>(page); };
+    put(10);
+    put(11);                                                  // two in a row: nothing ahead yet
+    CHECK_EQ(ww::coalesced_pages(), c0);
+    CHECK_EQ(prot_of(mem::kHeapBase + 12 * kPg), static_cast<DWORD>(PAGE_READONLY));
+    put(12);                                                  // the third: pages 13..20 go with it
+    CHECK_EQ(ww::coalesced_pages(), c0 + 8);
+    CHECK_EQ(prot_of(mem::kHeapBase + 20 * kPg), static_cast<DWORD>(PAGE_READWRITE));
+    CHECK_EQ(prot_of(mem::kHeapBase + 21 * kPg), static_cast<DWORD>(PAGE_READONLY));
+    for (uint64_t p = 13; p <= 20; ++p) put(p);               // no fault for them
+    CHECK_EQ(ww::faults(), f0 + 3);
+    std::vector<uint64_t> w;
+    ww::take_written(r, w);
+    CHECK_EQ(w.size(), static_cast<size_t>(11));               // 10..20: released ahead counts as written
+    CHECK(!ww::page_valid(r, 20) && ww::page_valid(r, 21));
+    // a guarded page ends the run before it
+    CHECK(ww::arm(r, 0, kPages));
+    CHECK(ww::guard(r, 34, 1));
+    put(30); put(31); put(32);
+    CHECK_EQ(prot_of(mem::kHeapBase + 33 * kPg), static_cast<DWORD>(PAGE_READWRITE));
+    CHECK_EQ(prot_of(mem::kHeapBase + 34 * kPg), static_cast<DWORD>(PAGE_NOACCESS));
+    ww::unguard(r, 34, 1);
+    // the end of the region ends it too
+    CHECK(ww::arm(r, 0, kPages));
+    put(kPages - 4); put(kPages - 3); put(kPages - 2);
+    CHECK_EQ(prot_of(mem::kHeapBase + (kPages - 1) * kPg), static_cast<DWORD>(PAGE_READWRITE));
+    teardown(r);
+    // off: every page faults
+    r = setup();
+    REQUIRE(r != nullptr);
+    CHECK(ww::arm(r, 0, kPages));
+    const uint64_t f1 = ww::faults();
+    for (uint64_t p = 0; p < 12; ++p) put(p);
+    CHECK_EQ(ww::faults(), f1 + 12);
+    teardown(r);
+}
+
 NXTEST(destroy_makes_pages_writable) {
     ww::Region* r = setup();
     REQUIRE(r != nullptr);
