@@ -7,11 +7,13 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -270,6 +272,39 @@ NXTEST(heap_lazy_commit_on_first_use) {
     CHECK(mem::heap_decommit(8 * kGran, kGran));                  // never committed: back to reserved
     CHECK(!touch(mem::kHeapBase + 8 * kGran, false));
     CHECK(!touch(mem::kHeapBase + 16 * kGran, false));            // past what heap_commit asked for
+    mem::shutdown();
+    _putenv_s("NXRT_MEMORY_HEAP_LAZY_COMMIT", "0");
+}
+
+// [memory] heap_lazy_commit with several threads touching the same 2 MiB granules at once and no write-tracker handler installed (as at
+// boot): the threads that lose the race find their page committed by another and must run their access again, not reach the crash handler
+// (a boot crash on the laptop, 2026-11-23). touch() catches what the vectored handlers pass on, so a lost access shows as a failure here.
+NXTEST(heap_lazy_commit_threads_racing_for_a_granule) {
+    mem::shutdown();
+    _putenv_s("NXRT_MEMORY_HEAP_LAZY_COMMIT", "1");
+    CHECK(mem::init());
+    CHECK(mem::heap_create(kHeapSmall));
+    constexpr uint64_t kGran = 2ull << 20, kGrans = 48;
+    CHECK(mem::heap_commit(0, kGrans * kGran));
+    if (mem::heap_committed() != 0) {   // Wine: lazy commit stays off
+        nxtest::skip("heap_lazy_commit is off on this host");
+        mem::shutdown();
+        _putenv_s("NXRT_MEMORY_HEAP_LAZY_COMMIT", "0");
+        return;
+    }
+    constexpr int kThreads = 8;
+    std::atomic<int> ready{0}, lost{0};
+    std::vector<std::thread> th;
+    for (int t = 0; t < kThreads; ++t)
+        th.emplace_back([&, t] {
+            ready.fetch_add(1);
+            while (ready.load() < kThreads) {}
+            for (uint64_t g = 0; g < kGrans; ++g)      // every thread a different page of the same granule at the same time
+                if (!touch(mem::kHeapBase + g * kGran + static_cast<uint64_t>(t) * 7 * kPg, (t & 1) != 0)) lost.fetch_add(1);
+        });
+    for (auto& x : th) x.join();
+    CHECK_EQ(lost.load(), 0);
+    CHECK_EQ(mem::heap_committed(), kGrans * kGran);
     mem::shutdown();
     _putenv_s("NXRT_MEMORY_HEAP_LAZY_COMMIT", "0");
 }
