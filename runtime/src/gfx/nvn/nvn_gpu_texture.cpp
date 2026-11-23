@@ -107,6 +107,8 @@ struct TexGpu {
     // CPU-streamed textures (tex_ensure_current): uploads for CPU writes that came at most kStreamGap presents apart, in a row
     uint32_t cpu_streak = 0, cpu_upload_at = 0;
     bool streamed = false;                              // rewritten by the CPU frame after frame: not write-watched, read again once per present
+    uint64_t content_hash = 0;                          // [nvn] count_same_uploads: the storage's hash at its last upload
+    bool content_known = false;
     uint32_t streamed_at = 0;                           // present count of the last read in that mode
     bool untiled = false;                               // the last upload went through gpu_untile (cheap enough to repeat every frame)
     // the nvn.tex.* gauges (tex_census): what the image costs, what its ASTC source would cost on a GPU that samples ASTC, and when a
@@ -1740,6 +1742,51 @@ mem::ww::Region* tex_ww() {
 
 bool tex_ww_wanted(const Texture& t, const TexGpu& g) { return t.cpu_coherent && t.mem && t.storage_size && !g.gpu_written && tex_ww(); }
 
+// ---- [nvn] count_same_uploads (N9, measurement, default off) ----------------------------------------------------------------------
+// A texture the CPU writes after its upload is uploaded again whole (its pages are write-watched). NX2navi found most such writes in
+// their game put back the very same bytes (49,660 re-uploads, 214 with new content). This counts how many of ours do: the storage is
+// hashed at every upload (a read of the whole texture, so measurement only) and a re-upload for a CPU write is "the same" when the hash
+// did not change. A line every 30 s while it counts; the hitch line gets tex_reuploads / tex_reuploads_same.
+std::atomic<uint64_t> g_reuploads{0}, g_reuploads_same{0}, g_reupload_bytes{0}, g_reupload_same_bytes{0}, g_same_unhashed{0};
+bool count_same_uploads_on() {
+    static const bool on = [] {
+        const bool v = nxrt::config_get_bool("nvn", "count_same_uploads", false);
+        if (v) {
+            nxrt::hitch_add_counter("tex_reuploads", []() -> uint64_t { return g_reuploads.load(std::memory_order_relaxed); });
+            nxrt::hitch_add_counter("tex_reuploads_same", []() -> uint64_t { return g_reuploads_same.load(std::memory_order_relaxed); });
+        }
+        return v;
+    }();
+    return on;
+}
+void note_upload_content(const Texture& t, TexGpu& g, bool for_cpu_write) {
+    uint64_t h = 0;
+    const bool ok = texprep::hash_storage(t, h);
+    if (for_cpu_write) {
+        g_reuploads.fetch_add(1, std::memory_order_relaxed);
+        g_reupload_bytes.fetch_add(t.storage_size, std::memory_order_relaxed);
+        if (!ok || !g.content_known) {
+            g_same_unhashed.fetch_add(1, std::memory_order_relaxed);
+        } else if (h == g.content_hash) {
+            g_reuploads_same.fetch_add(1, std::memory_order_relaxed);
+            g_reupload_same_bytes.fetch_add(t.storage_size, std::memory_order_relaxed);
+        }
+    }
+    g.content_known = ok;
+    g.content_hash = h;
+    using clk = std::chrono::steady_clock;
+    static clk::time_point next = clk::now() + std::chrono::seconds(30);
+    if (clk::now() >= next) {
+        next = clk::now() + std::chrono::seconds(30);
+        const uint64_t n = g_reuploads.load(), same = g_reuploads_same.load();
+        NXLOG_I(kTag, "re-uploads for CPU writes so far ([nvn] count_same_uploads): %llu (%llu MiB), %llu with the same content as their last upload "
+                      "(%llu MiB, %.0f%%), %llu not comparable (storage not readable, or no hash of the last upload)",
+                static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_reupload_bytes.load() >> 20), static_cast<unsigned long long>(same),
+                static_cast<unsigned long long>(g_reupload_same_bytes.load() >> 20), n ? 100.0 * static_cast<double>(same) / static_cast<double>(n) : 0.0,
+                static_cast<unsigned long long>(g_same_unhashed.load()));
+    }
+}
+
 void tex_ww_arm(const Texture& t, const TexGpu& g) {
     if (!tex_ww_wanted(t, g)) return;
     mem::ww::Region* r = tex_ww();
@@ -2594,6 +2641,7 @@ void tex_ensure_current(Texture* t, Frame& f) {
         }
     }
     if (g->gpu_written && !dirty) return;        // the GPU rendered it and the CPU did not write since
+    if (count_same_uploads_on() && !g->sparse) note_upload_content(*t, *g, dirty && g->uploaded && !g->gpu_written);
     if (g->sparse) {                             // a sparse-residency image: the dirty tiles only
         t->cpu_dirty.exchange(false);
         sparse_update(t, *g, f);
