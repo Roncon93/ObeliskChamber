@@ -6451,6 +6451,7 @@ void replay_begin_submit(Frame& f) {
     F = &f;
     tex_poll_cpu_writes();
     dynres_tick(counters().presents.load());
+    untile_scratch_tick(counters().presents.load());
     if (extras::LowLatency* ll = extras::lowlat()) ll->submit_begin();     // RENDERSUBMIT_START of the frame (S14)
     if (g_trace_frame == -2) {
         // [nvn] trace_frame = "6050" or "6050,9300": every listed presented frame is traced (the first one is the main one)

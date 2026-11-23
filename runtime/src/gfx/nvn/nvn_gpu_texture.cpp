@@ -2207,10 +2207,29 @@ void tex_residency_tick(Frame& f) {
         }
         pct = std::max(pct, os_pct);
     }
-    if (pct < cfg.percent) return;
-    const bool urgent = pct >= cfg.urgent_percent;
-    const uint32_t idle_ms = static_cast<uint32_t>(urgent ? cfg.urgent_idle_s : cfg.idle_s) * 1000u;
-    const uint64_t want = std::min<uint64_t>(budget / 100 * static_cast<uint64_t>(pct - cfg.percent + 5), 512ull << 20);
+    // [gfx] residency_trim_idle_s (auto: 300 with memory limits scaled to the PC, else 0 = off): below residency_percent, textures no draw used
+    // for this long are demoted too, at most 128 MiB and 64 textures every 5 s. The game keeps the files (and textures) of the areas it
+    // visited in its cache; on the laptop 1.4-1.6 GB of our images were unused after a few minutes. Without it they stay until video memory
+    // nears the budget, by which time the driver's blocks have grown (#155, #162). A texture a draw wants again is made whole by
+    // tex_residency_restore (a few frames of its smaller levels).
+    static const uint32_t trim_ms = [] {
+        const std::string v = nxrt::config_get_str("gfx", "residency_trim_idle_s", "auto");
+        const int64_t s = (v == "auto" || v.empty()) ? (nxrt::mem::limits_scaled() ? 300 : 0) : nxrt::config_get_int("gfx", "residency_trim_idle_s", 0);
+        const uint32_t ms = static_cast<uint32_t>(std::clamp<int64_t>(s, 0, 86400) * 1000);
+        NXLOG_I(kTag, "residency: textures unused for %u s are demoted below the pressure line too ([gfx] residency_trim_idle_s%s%s)", ms / 1000u,
+                ms ? "" : ": off", nxrt::mem::limits_scaled() ? "; limits scaled" : "");
+        return ms;
+    }();
+    static uint32_t trim_at = 0;
+    const bool trim = pct < cfg.percent;
+    if (trim) {
+        if (!trim_ms || (trim_at && now - trim_at < 5000u)) return;
+        trim_at = now;
+    }
+    const bool urgent = !trim && pct >= cfg.urgent_percent;
+    const uint32_t idle_ms = trim ? trim_ms : static_cast<uint32_t>(urgent ? cfg.urgent_idle_s : cfg.idle_s) * 1000u;
+    const uint64_t want = trim ? (128ull << 20) : std::min<uint64_t>(budget / 100 * static_cast<uint64_t>(pct - cfg.percent + 5), 512ull << 20);
+    const int max_n = trim ? 64 : 400;
     std::unordered_set<const Texture*> reg;
     pool_registered_textures(reg);
     std::vector<std::pair<uint32_t, Texture*>> cand;
@@ -2226,7 +2245,7 @@ void tex_residency_tick(Frame& f) {
     uint64_t freed = 0;
     int n = 0;
     for (auto& [age, t] : cand) {
-        if (freed >= want || n >= 400) break;
+        if (freed >= want || n >= max_n) break;
         const uint64_t saved = tex_demote(t, t->gpu, f);
         if (!saved) continue;
         freed += saved;
@@ -2240,7 +2259,7 @@ void tex_residency_tick(Frame& f) {
     if (n && (logged++ < 40 || logged % 50 == 0))
         NXLOG_I(kTag, "residency: video memory at %d%% of the %.2f GiB budget: %d textures unused for %u s and more demoted (%.0f MB given back; %zu demoted "
                       "in all, %d of %zu candidates)%s", pct, static_cast<double>(budget) / (1024.0 * 1024.0 * 1024.0), n, idle_ms / 1000,
-                static_cast<double>(freed) / (1024.0 * 1024.0), g_demoted.size(), n, cand.size(), urgent ? " [urgent]" : "");
+                static_cast<double>(freed) / (1024.0 * 1024.0), g_demoted.size(), n, cand.size(), urgent ? " [urgent]" : (trim ? " [trim: residency_trim_idle_s]" : ""));
 }
 
 // Once per present: the demoted textures a draw used again (everything once the marks are incomplete) are made whole, the most recently
@@ -2362,12 +2381,14 @@ struct Untiler {
     VkPipeline pipe = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     static constexpr uint32_t kRing = 16;
-    struct Entry { VkDescriptorSet set = VK_NULL_HANDLE; gfx::Buffer scratch; uint64_t serial = 0; };
+    struct Entry { VkDescriptorSet set = VK_NULL_HANDLE; gfx::Buffer scratch; uint64_t serial = 0, used_at = 0; };   // used_at: presents
     Entry ring[kRing];
     uint32_t next = 0;
     VkDeviceSize ssbo_align = 256;
 };
 Untiler g_untile;
+std::atomic<uint64_t> g_untile_scratch_bytes{0};
+
 
 bool untiler_init() {
     Untiler& u = g_untile;
@@ -2524,9 +2545,34 @@ bool gpu_untile_impl(Texture* t, TexGpu& g, Frame& f, const char** why, bool may
     r.imageExtent = {g.base.width, g.base.height, 1};
     copy_regions_to_image(f, g, e.scratch.buffer, {r});
     e.serial = f.serial;
+    e.used_at = counters().presents.load(std::memory_order_relaxed);
     return true;
 }
 }  // namespace
+
+// [nvn] untile_scratch_idle (default on): a ring entry's scratch buffer grows to the largest level it untiled and was kept for the whole
+// session, so the 16 entries trended to 16 x the largest texture of video memory. Now one is released once its GPU work is done when it is
+// over 64 MiB, or after 600 presents without an untile. Render thread, start of a submission.
+void untile_scratch_tick(uint64_t presents) {
+    static const bool on = config_get_bool("nvn", "untile_scratch_idle", true);
+    static const bool gauged = (nxrt::gauge_register("nvn.untile.scratch_mb", [] { return static_cast<int64_t>(g_untile_scratch_bytes.load(std::memory_order_relaxed) >> 20); }), true);
+    (void)gauged;
+    Untiler& u = g_untile;
+    if (!u.ok) return;
+    uint64_t live = 0;
+    for (Untiler::Entry& e : u.ring) {
+        if (!e.scratch) continue;
+        const bool done = !e.serial || completed_serial() >= e.serial;
+        if (on && done && (e.scratch.size > (64ull << 20) || presents - e.used_at > 600)) {
+            gfx::Buffer old = e.scratch;
+            defer_destroy_vk([old]() mutable { device().destroy_buffer(old); });
+            e.scratch = gfx::Buffer{};
+            continue;
+        }
+        live += e.scratch.size;
+    }
+    g_untile_scratch_bytes.store(live, std::memory_order_relaxed);
+}
 
 // The caller copies or clears the image, so it needs the real content now: a stand-in would end up in the copy ([nvn] tex_async).
 void tex_ensure_exact(Texture* t, Frame& f) {
@@ -3711,6 +3757,11 @@ bool buffer_format_ok(VkFormat f, bool storage) {
 }  // namespace
 
 VkBufferView make_buffer_view(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range, VkFormat format) {
+    static const bool gauged = (nxrt::gauge_register("nvn.bufviews", [] {   // buffer views cached (dropped with their buffer only)
+        std::lock_guard<std::mutex> g(g_bufview_mu);
+        return static_cast<int64_t>(g_bufviews.size());
+    }), true);
+    (void)gauged;
     std::lock_guard<std::mutex> lk(g_bufview_mu);
     const BufViewKey key{buffer, offset, range, format};
     if (auto it = g_bufviews.find(key); it != g_bufviews.end()) return it->second;

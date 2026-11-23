@@ -282,6 +282,7 @@ void dynres_enable(void (*apply)(float scale));                           // tur
 void dynres_on(bool on);                                                 // from a menu, after dynres_enable: off puts the scale back to 1
 void dynres_set(double target_fps, double min_scale, double min_gain_pct);   // from a menu; a negative (or zero scale) value keeps the ini's
 int dynres_scale_percent();                                               // the scale in force (0: dynamic resolution is off)
+void untile_scratch_tick(uint64_t presents);                              // render thread, start of a submission: idle untile scratch released
 void dynres_tick(uint64_t presents);                                      // render thread, start of a submission
 // Records an upload when the texture's memory was not yet uploaded or the CPU wrote it since (and the GPU did not render it).
 // Must be called with no render pass open on `f.cb`. Leaves the image in SHADER_READ_ONLY_OPTIMAL after an upload.

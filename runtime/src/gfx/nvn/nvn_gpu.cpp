@@ -66,6 +66,11 @@ nxrt::GaugeCounter g_gauge_deferred("nvn.deferred_destroy");     // closures wai
 nxrt::GaugeCounter g_gauge_render_queue("nvn.render_queue");     // jobs queued for the render thread
 nxrt::GaugeCounter g_gauge_barriers_mem("nvn.cnt.barriers_mem");   // full memory barriers recorded (cumulative; per frame = delta / frames)
 nxrt::GaugeCounter g_gauge_barriers_img("nvn.cnt.barriers_img");   // image layout barriers recorded (cumulative)
+std::atomic<int64_t> g_upload_peak{0};                             // most bytes of a slot's 8 MiB upload buffer used by one submission
+struct UploadPeakGauge {
+    UploadPeakGauge() { nxrt::gauge_register("nvn.upload.slot_peak_kb", [] { return g_upload_peak.load(std::memory_order_relaxed) >> 10; }); }
+    ~UploadPeakGauge() { nxrt::gauge_unregister("nvn.upload.slot_peak_kb"); }
+} g_upload_peak_gauge;
 
 struct Slot {
     VkCommandPool pool = VK_NULL_HANDLE;
@@ -740,6 +745,8 @@ UploadAlloc Frame::upload(VkDeviceSize size, VkDeviceSize align) {
     VkDeviceSize off = (s.upload_off + align - 1) & ~(align - 1);
     if (off + size <= kUploadBytes) {
         s.upload_off = off + size;
+        if (static_cast<int64_t>(s.upload_off) > g_upload_peak.load(std::memory_order_relaxed))
+            g_upload_peak.store(static_cast<int64_t>(s.upload_off), std::memory_order_relaxed);   // render thread only
         UploadAlloc a;
         a.buffer = s.upload.buffer;
         a.offset = off;

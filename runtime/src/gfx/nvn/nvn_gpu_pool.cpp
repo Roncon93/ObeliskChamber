@@ -848,6 +848,7 @@ uint32_t g_sub_idx = 0, g_sub_last_present = 0xffffffffu;     // index of the su
 int64_t g_hotcopy_pages = 0, g_hotcopy_subs = 0, g_hotcopy_binds = 0, g_hotcopy_over = 0;
 std::vector<Mirror*> g_mirrors;      // render thread
 uint64_t g_mirror_bytes = 0;         // video memory of the chunks made
+std::atomic<int64_t> g_st_spare_bytes{0};   // the chunk made ahead ([nvn] mirror_spare), not in g_mirror_bytes
 bool g_mirror_on = false;            // this submission reads mirrors (mode on and, with [nvn] gpuperf_ab, an "on" window)
 std::vector<uint64_t> g_written_tmp;
 std::vector<VkBufferCopy> g_copy_tmp;
@@ -1098,6 +1099,7 @@ struct MirrorGauges {
         nxrt::gauge_register("nvn.mirror.dev_binds", [] { return g_st_dev_binds.load(std::memory_order_relaxed); });
         nxrt::gauge_register("nvn.mirror.host_binds", [] { return g_st_host_binds.load(std::memory_order_relaxed); });
         nxrt::gauge_register("nvn.mirror.hot_pages", [] { return g_st_hot.load(std::memory_order_relaxed); });
+        nxrt::gauge_register("nvn.mirror.spare_mb", [] { return g_st_spare_bytes.load(std::memory_order_relaxed) >> 20; });
         // the hitch log (nxrt/gauge.h): growth during a slow frame
         nxrt::hitch_add_counter("pool_mirror_copied_kb", []() -> uint64_t { return static_cast<uint64_t>(g_st_copied.load(std::memory_order_relaxed)) >> 10; });
         nxrt::hitch_add_counter("write_faults", []() -> uint64_t { return mem::ww::faults(); });
@@ -1106,7 +1108,7 @@ struct MirrorGauges {
         nxrt::hitch_add_counter("pools_imported", []() -> uint64_t { Counters* c = counters_if(); return c ? c->pools_imported.load(std::memory_order_relaxed) : 0; });
     }
     ~MirrorGauges() {
-        for (const char* n : {"nvn.mirror.bytes", "nvn.mirror.copied_mb", "nvn.mirror.dev_binds", "nvn.mirror.host_binds", "nvn.mirror.hot_pages", "nvn.mirror.evictions", "nvn.mirror.evicted_mb"}) nxrt::gauge_unregister(n);
+        for (const char* n : {"nvn.mirror.bytes", "nvn.mirror.copied_mb", "nvn.mirror.dev_binds", "nvn.mirror.host_binds", "nvn.mirror.hot_pages", "nvn.mirror.evictions", "nvn.mirror.evicted_mb", "nvn.mirror.spare_mb"}) nxrt::gauge_unregister(n);
     }
 };
 MirrorGauges g_mirror_gauges;
@@ -1145,7 +1147,10 @@ void spare_loop() {
         gfx::Buffer b;
         const bool ok = device().create_buffer(kChunkBytes, kMirrorUsage, gfx::MemoryUse::GpuOnly, &b, "nvn pool mirror (made ahead)") == VK_SUCCESS;
         lk.lock();
-        if (ok && !g_spare.stop) g_spare.buf = b;
+        if (ok && !g_spare.stop) {
+            g_spare.buf = b;
+            g_st_spare_bytes.store(static_cast<int64_t>(b.size), std::memory_order_relaxed);
+        }
         else {
             if (ok) device().destroy_buffer(b);
             g_spare.failed = !ok;            // out of video memory: no more spares this session
@@ -1164,6 +1169,7 @@ gfx::Buffer spare_take(uint64_t budget_left) {
     if (g_spare.buf.buffer) {
         got = g_spare.buf;
         g_spare.buf = gfx::Buffer{};
+        g_st_spare_bytes.store(0, std::memory_order_relaxed);
         g_spare_taken.fetch_add(1, std::memory_order_relaxed);
     }
     if (budget_left >= 2 * kChunkBytes) {
@@ -1184,6 +1190,7 @@ void spare_shutdown() {
     std::lock_guard<std::mutex> lk(g_spare.mu);
     if (g_spare.buf.buffer) device().destroy_buffer(g_spare.buf);
     g_spare.buf = gfx::Buffer{};
+    g_st_spare_bytes.store(0, std::memory_order_relaxed);
     g_spare.stop = g_spare.want = g_spare.failed = false;   // a later back end (tests) starts clean
 }
 
@@ -1194,10 +1201,30 @@ void spare_shutdown() {
 // old scenes otherwise keep video memory that a new scene's pools then cannot get (they are read over PCIe). An evicted chunk's pages are
 // read from the pool again, and the chunk is made again when a draw wants a page in it. Never a chunk asked for in the last 5 s, nor one
 // holding a compute result newer than the pool. Render thread.
+// auto: 30 s with memory limits scaled to the PC (16 GB of RAM or an 8 GB card and less), else 0 (off).
 uint32_t evict_idle_ms() {
-    static const uint32_t ms = static_cast<uint32_t>(std::clamp<int64_t>(config_get_int("nvn", "pool_mirror_evict_idle_s", 0), 0, 86400) * 1000);
+    static const uint32_t ms = [] {
+        const std::string v = config_get_str("nvn", "pool_mirror_evict_idle_s", "auto");
+        const int64_t s = (v == "auto" || v.empty()) ? (mem::limits_scaled() ? 30 : 0) : config_get_int("nvn", "pool_mirror_evict_idle_s", 0);
+        return static_cast<uint32_t>(std::clamp<int64_t>(s, 0, 86400) * 1000);
+    }();
     return ms;
 }
+// [nvn] pool_mirror_trim_idle_s (auto: 120 with memory limits scaled, else 0 = off): a chunk no draw or dispatch asked for in this many seconds
+// is given back whatever the pressure, checked every 5 s. Without it the copies of every scene the game keeps stay until video memory nears
+// the budget (#155, #162), so the copies follow what the game draws rather than everything it ever loaded.
+uint32_t trim_idle_ms() {
+    static const uint32_t ms = [] {
+        const std::string v = config_get_str("nvn", "pool_mirror_trim_idle_s", "auto");
+        const int64_t s = (v == "auto" || v.empty()) ? (mem::limits_scaled() ? 120 : 0) : config_get_int("nvn", "pool_mirror_trim_idle_s", 0);
+        const uint32_t r = static_cast<uint32_t>(std::clamp<int64_t>(s, 0, 86400) * 1000);
+        NXLOG_I(kTag, "pool copies: idle chunks given back after %u s under pressure, %u s always ([nvn] pool_mirror_evict_idle_s, pool_mirror_trim_idle_s%s)",
+                evict_idle_ms() / 1000u, r / 1000u, mem::limits_scaled() ? "; limits scaled" : "");
+        return r;
+    }();
+    return ms;
+}
+uint32_t g_trim_checked = 0;
 uint32_t g_mirror_clock = 1;                     // mirror_clock_ms() at the start of the submission being recorded
 uint32_t g_evict_checked = 0, g_evict_tried = 0;  // last proactive check (mirror_begin_submit) / on-demand try (mirror_chunk)
 uint64_t g_evict_credit = 0;                     // bytes freed under pressure that new chunks of the same burst may take
@@ -1270,8 +1297,16 @@ uint64_t mirror_evict_idle(uint64_t want, uint32_t idle_ms, const char* why) {
 // Once a second at a submission start: idle chunks go back while video memory is within 5 points of pool_mirror_pressure_percent, or while
 // the copies are over 85% of their cap (down to 75%).
 void mirror_evict_tick() {
+    if (g_mirrors.empty()) return;
+    if (const uint32_t trim = trim_idle_ms()) {
+        const uint32_t since = g_mirror_clock - g_trim_checked;
+        if (!g_trim_checked || (since >= 5000u && since < 0x80000000u)) {
+            g_trim_checked = g_mirror_clock;
+            mirror_evict_idle(g_mirror_bytes, trim, "unused for long");
+        }
+    }
     const uint32_t idle = evict_idle_ms();
-    if (!idle || g_mirrors.empty()) return;
+    if (!idle) return;
     const uint32_t since = g_mirror_clock - g_evict_checked;
     if (g_evict_checked && (since < 1000u || since >= 0x80000000u)) return;
     g_evict_checked = g_mirror_clock;
