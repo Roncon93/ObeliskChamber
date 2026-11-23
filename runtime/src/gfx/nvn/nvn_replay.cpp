@@ -2735,7 +2735,8 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
                         }
                         bool served = false;
                         if (d.nvn_stage != kCompute && !g_shadowing && br.ok) {
-                            storage_probe(bind.addr, bi.range, d.nvn_stage == kVertex);
+                            static const bool probe = nxrt::config_get_bool("nvn", "storage_probe", false);   // diagnostics only
+                            if (probe) storage_probe(bind.addr, bi.range, d.nvn_stage == kVertex);
                             // [nvn] storage_read_copy = 1: a vertex shader's storage buffer is read from the device copy when it is valid; 2: any graphics stage.
                             // Assumes the shader does not write the buffer (the pages stay valid: no gpu_wrote).
                             static const int sto_mode = static_cast<int>(nxrt::config_get_int("nvn", "storage_read_copy", 2));
@@ -5853,12 +5854,27 @@ bool is_bind_op(Op op) {
     }
 }
 
-void mark_dirty(const RecordReader& r) {
+// [nvn] same_binds_skip (default on; needs same_binds): a buffer, texture, image or pool bind that bind_is_same found to change nothing in
+// S is not applied either. Its body would write the same values into S again (bind_is_same compares with S itself for these ops; the raw
+// state binds compare with the last block seen, so they still run). About 11,000 such binds a frame in a busy hub. Technique from
+// fefw-recomp #119 (metrist38).
+bool same_binds_skip_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "same_binds_skip", true);
+    return on;
+}
+// True: the op is a bind that changes nothing in S and need not be applied (same_binds_skip).
+bool mark_dirty(const RecordReader& r) {
     if ((same_binds_on() || rs_on()) && is_bind_op(r.op())) {
         ++g_rs.binds;
         if (bind_is_same(r)) {
             ++g_rs.binds_same;
-            if (same_binds_on()) return;
+            if (same_binds_on()) {
+                switch (r.op()) {
+                    case Op::BindBuffers: case Op::BindTextures: case Op::BindImages: case Op::SetTexturePool: case Op::SetSamplerPool:
+                        return same_binds_skip_on();
+                    default: return false;
+                }
+            }
         }
     }
     switch (r.op()) {
@@ -5882,6 +5898,7 @@ void mark_dirty(const RecordReader& r) {
         case Op::SetRenderTargets: g_dirty = kAllDirty; break;
         default: break;
     }
+    return false;
 }
 
 // ---- windowed GPU counters (see g_cw) ----------------------------------------------------------------------------------------
@@ -5920,7 +5937,7 @@ void run_list(const CmdList& list, int depth) {
     if (depth > kMaxDepth) { NVN_LOG_ONCE("depth", "CallCommands nesting too deep"); return; }
     counters().lists_replayed.fetch_add(1, std::memory_order_relaxed);
     for (RecordReader r(list); r.next();) {
-        mark_dirty(r);
+        const bool same_bind = mark_dirty(r);
         // [nvn] compute_overlap: anything but state or another dispatch (do_dispatch decides for that one) ends the group with its barrier
         if (covl::g.pending && r.op() != Op::Dispatch && (r.op() == Op::Barrier || r.op() == Op::DispatchIndirect || !compute_out_may_wait(r.op()))) covl::flush();
         // [nvn] dispatch_barriers = tracked: the same for the dispatches left open
@@ -5931,6 +5948,7 @@ void run_list(const CmdList& list, int depth) {
             if (out_lazy()) out_before_op(r);                                               // compute shadows: results back to the pool first
             else if (out_any() && !compute_out_may_wait(r.op())) flush_compute_out(kOutOther);
         }
+        if (same_bind) continue;     // [nvn] same_binds_skip: S already holds what it would write
         switch (r.op()) {
             case Op::Nop: break;
             case Op::BindProgram: apply_bind_program(r.payload<P_BindProgram>()); break;

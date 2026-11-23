@@ -936,6 +936,15 @@ void bit_put(std::vector<uint64_t>& v, uint64_t i, bool on) {
     if (on) v[static_cast<size_t>(i >> 6)] |= uint64_t{1} << (i & 63);
     else v[static_cast<size_t>(i >> 6)] &= ~(uint64_t{1} << (i & 63));
 }
+// Sets bits [first, last] a word at a time (a bind of a skinned mesh's bone matrices spans many pages; fefw-recomp #119, metrist38).
+void bits_on(std::vector<uint64_t>& v, uint64_t first, uint64_t last) {
+    for (uint64_t w = first >> 6, lw = last >> 6; w <= lw; ++w) {
+        const uint64_t lo = w == first >> 6 ? (first & 63) : 0, hi = w == lw ? (last & 63) : 63;
+        const uint64_t mask = (hi == 63 ? ~uint64_t{0} : ((uint64_t{1} << (hi + 1)) - 1)) & (~uint64_t{0} << lo);
+        uint64_t& x = v[static_cast<size_t>(w)];
+        if ((x & mask) != mask) x |= mask;
+    }
+}
 
 bool page_valid(const Mirror& m, uint64_t p) { return mem::ww::page_valid(m.ww, p); }
 void out_register(Mirror* m);
@@ -1443,7 +1452,7 @@ BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use) {
         out.buffer = cb;
         out.offset = poff - (first / chunk_pages) * kChunkBytes;
         out.avail = std::min<uint64_t>(kChunkBytes, m->pool_bytes - (first / chunk_pages) * kChunkBytes) - out.offset;
-        for (uint64_t p = first; p <= last; ++p) bit_put(m->used, p, true);
+        bits_on(m->used, first, last);
         if (hot_copy_on()) {
             const uint8_t sb = static_cast<uint8_t>(1u << std::min<uint32_t>(g_sub_idx, 7));
             bool via_tv = false;
