@@ -638,7 +638,8 @@ uint32_t load_pick(::Ctx* c, int i) {
         std::lock_guard<std::mutex> lk(g_mu);
         if (!has_save(slot)) return kPickRefused;
     }
-    if (!g_prompt_ok) return load_direct(c, i, slot);
+    static const bool no_prompt = config_get_bool("fefw", "load_no_prompt", false);   // #187 test: the direct load, without the game's prompt
+    if (!g_prompt_ok || no_prompt) return load_direct(c, i, slot);
     const uint64_t root = save_root();
     if (!root) return kPickRefused;
     static char path[16];                 // static: the prompt may keep the pointers past this call
