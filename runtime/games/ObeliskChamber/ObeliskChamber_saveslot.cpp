@@ -766,8 +766,46 @@ void saveslot_install(uint64_t base) {
     services::set_save_path_hook(&path_hook);      // before the game mounts its save data
 }
 
+// [fefw] diag_187 (default off; issue #187, the details box after a Load from the in-game list): each press of a button other than A and B
+// logs the pressed word, the main sequence's state and the game's UI globals (the non-zero words of main+0x22a1000..0x22a2000, where the
+// report window and the windows' singletons live), at most 48 times a run. Compared between a press that opens the details box (after a
+// Continue from the title) and one that does not (after a Load from the list).
+void diag_187() {
+    static const bool on = config_get_bool("fefw", "diag_187", false);
+    static int logged = 0;
+    static uint32_t last = 0;
+    if (!on || logged >= 48 || !g_base) return;
+    uint64_t var = 0, input = 0;
+    if (!rd(g_base + 0x216a4b0, &var) || !rd(var, &input) || !input) return;
+    uint32_t pressed = 0;
+    if (!rd(input + 0x3b8, &pressed)) return;
+    const uint32_t fresh = pressed & ~last & ~3u;
+    last = pressed;
+    if (!fresh) return;
+    ++logged;
+    uint64_t seq = 0;
+    uint32_t state = 0;
+    if (rd(g_base + kMainSeq, &seq) && seq) rd(seq + 0x98, &state);
+    std::string words;
+    char b[48];
+    for (uint64_t off = 0; off < 0x1000; off += 8) {
+        uint64_t v = 0;
+        if (!rd(g_base + 0x22a1000 + off, &v) || !v) continue;
+        std::snprintf(b, sizeof b, " %llx=%llx", static_cast<unsigned long long>(off), static_cast<unsigned long long>(v));
+        words += b;
+    }
+    std::string slot;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        slot = g_active;
+    }
+    NXLOG_I(kTag, "diag187: pressed 0x%x (new 0x%x), main sequence state %u, slot %s; 0x22a1000 page:%s", pressed, fresh, state, slot.c_str(),
+            words.c_str());
+}
+
 // Main thread, once per frame: hooks the entries once the game's data is there and is the build the addresses are for.
 void saveslot_frame() {
+    diag_187();
     if (g_hooked && g_tc_ok) title_continue_frame();
     if (g_hooked || g_failed || !g_on || !g_base) return;
     uint64_t probe = 0;
