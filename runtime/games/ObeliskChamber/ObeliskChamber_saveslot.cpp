@@ -766,40 +766,60 @@ void saveslot_install(uint64_t base) {
     services::set_save_path_hook(&path_hook);      // before the game mounts its save data
 }
 
-// [fefw] diag_187 (default off; issue #187, the details box after a Load from the in-game list): each press of a button other than A and B
-// logs the pressed word, the main sequence's state and the game's UI globals (the non-zero words of main+0x22a1000..0x22a2000, where the
-// report window and the windows' singletons live), at most 48 times a run. Compared between a press that opens the details box (after a
-// Continue from the title) and one that does not (after a Load from the list).
+// [fefw] diag_187 (default off; issue #187, the details box after a Load from the in-game list): the first press of X (pressed bit 0x4)
+// takes a copy of the game's globals (main+0x2200000..0x2240000 and +0x22a0000..0x22b0000); every later X press logs the words that differ
+// from that copy (at most 600 a line), with the main sequence's state and the slot in use. At most 16 lines a run. Compared between X
+// presses that open the details box and ones that do not.
 void diag_187() {
     static const bool on = config_get_bool("fefw", "diag_187", false);
     static int logged = 0;
     static uint32_t last = 0;
-    if (!on || logged >= 48 || !g_base) return;
+    static std::vector<uint64_t> base;
+    static const uint64_t ranges[][2] = {{0x2200000, 0x2240000}, {0x22a0000, 0x22b0000}};
+    if (!on || logged >= 16 || !g_base) return;
     uint64_t var = 0, input = 0;
     if (!rd(g_base + 0x216a4b0, &var) || !rd(var, &input) || !input) return;
     uint32_t pressed = 0;
     if (!rd(input + 0x3b8, &pressed)) return;
-    const uint32_t fresh = pressed & ~last & ~3u;
+    const uint32_t fresh = pressed & ~last & 0x4u;
     last = pressed;
     if (!fresh) return;
     ++logged;
     uint64_t seq = 0;
     uint32_t state = 0;
     if (rd(g_base + kMainSeq, &seq) && seq) rd(seq + 0x98, &state);
-    std::string words;
-    char b[48];
-    for (uint64_t off = 0; off < 0x1000; off += 8) {
-        uint64_t v = 0;
-        if (!rd(g_base + 0x22a1000 + off, &v) || !v) continue;
-        std::snprintf(b, sizeof b, " %llx=%llx", static_cast<unsigned long long>(off), static_cast<unsigned long long>(v));
-        words += b;
-    }
     std::string slot;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         slot = g_active;
     }
-    NXLOG_I(kTag, "diag187: pressed 0x%x (new 0x%x), main sequence state %u, slot %s; 0x22a1000 page:%s", pressed, fresh, state, slot.c_str(),
+    std::vector<uint64_t> now;
+    for (const auto& r : ranges)
+        for (uint64_t off = r[0]; off < r[1]; off += 8) {
+            uint64_t v = 0;
+            if (!mem::is_mapped(g_base + off, 8) || !rd(g_base + off, &v)) v = 0xdeadull;
+            now.push_back(v);
+        }
+    if (base.empty()) {
+        base = now;
+        NXLOG_I(kTag, "diag187: X press 1, main sequence state %u, slot %s: the globals are copied (%zu words)", state, slot.c_str(), now.size());
+        return;
+    }
+    std::string words;
+    int n = 0, shown = 0;
+    size_t i = 0;
+    char b[64];
+    for (const auto& r : ranges)
+        for (uint64_t off = r[0]; off < r[1]; off += 8, ++i) {
+            if (now[i] == base[i]) continue;
+            ++n;
+            if (shown >= 600) continue;
+            ++shown;
+            std::snprintf(b, sizeof b, " %llx:%llx>%llx", static_cast<unsigned long long>(off), static_cast<unsigned long long>(base[i]),
+                          static_cast<unsigned long long>(now[i]));
+            words += b;
+        }
+    NXLOG_I(kTag, "diag187: X press %d, main sequence state %u, slot %s: %d words differ from press 1:%s", logged, state, slot.c_str(), n,
             words.c_str());
 }
 
