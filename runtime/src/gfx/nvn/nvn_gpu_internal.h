@@ -107,6 +107,17 @@ struct Frame {
 bool split_submission(Frame& f);
 uint64_t split_count();   // command buffers handed over early so far
 
+// [nvn] early_uploads (default on): each submission has a second command buffer that goes to the GPU just before its own, with one barrier
+// at its end. First uploads of textures nothing in the submission has used yet are recorded there instead of between the draws, so the
+// replay does not end the render pass for them (Eden's upload command buffer, vk_scheduler.cpp). Only for work that depends on no earlier
+// GPU work of the submission: it runs before all of it.
+bool early_uploads_on();
+// A Frame of the same submission (slot, serial, staging, defer) whose cb is the upload command buffer. False when there is none (feature
+// off, no slot, the debug path, or the buffer went to the GPU with a split part already): record inline then.
+bool upload_frame(const Frame& f, Frame* out);
+void note_early_upload();          // counts one texture uploaded there (hitch line "early_uploads", gpustats)
+uint64_t early_upload_count();
+
 // Destruction: fn runs once every submission made so far (and the one being recorded) has completed.
 void defer_destroy(std::function<void()> fn);
 // The same for a closure that only calls Vulkan / VMA destroy functions (and atomic gauges) on objects nothing else refers to any more: with
@@ -330,6 +341,10 @@ bool tex_pool_preparation_pending(Texture* t);
 // (ASTC or BCn from the game's memory) whose image never held content, is not rendered to, and is not a depth image. Its pool element is the dummy
 // until then. Render thread.
 bool tex_first_upload_deferrable(Texture* t);
+// [nvn] early_uploads: a first upload that may go in the submission's upload command buffer, ahead of everything recorded so far. An ASTC
+// or BC asset from the game's memory (written by the CPU, never by the GPU) whose image no command has used yet: no image, or one still in
+// the undefined layout (every use transitions it first). Not a sparse texture of a virtual pool.
+bool tex_early_upload_ok(Texture* t);
 // The image holds a stand-in of the texture's current content and the texture is waiting for its upload (its job's result is there, or the
 // render thread will keep the stand-in): the swap may wait a frame (the pool upload budget). Render thread.
 bool tex_standin_swap_pending(Texture* t);

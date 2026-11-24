@@ -1814,12 +1814,52 @@ void prepare_textures(const ProgLayout& pl) {
     if (need.empty() && need_storage.empty()) return;
     for (Texture* t : need) out_texture_read(t);           // an upload reads game memory: compute results held there go back first
     for (Texture* t : need_storage) out_texture_read(t);
+    // [nvn] early_uploads: first uploads of assets no command of this submission has used yet go in the submission's upload command buffer,
+    // which the GPU runs before everything recorded so far; the pass stays open for them. Ended only for what is left (`inline_n`).
+    static thread_local std::vector<uint8_t> early;
+    early.assign(need.size(), 0);
+    Frame uf;
+    size_t inline_n = need.size();
+    if (early_uploads_on()) {
+        for (size_t i = 0; i < need.size(); ++i)
+            if (tex_early_upload_ok(need[i])) {
+                early[i] = 1;
+                --inline_n;
+            }
+        if (inline_n < need.size() && !upload_frame(*F, &uf)) {
+            std::fill(early.begin(), early.end(), 0);
+            inline_n = need.size();
+        }
+    }
+    auto run_early = [&] {
+        for (size_t i = 0; i < need.size(); ++i) {
+            if (!early[i]) continue;
+            Texture* t = need[i];
+            const bool slice = budgeted(t, i);
+            if (slice && spent >= cap) {
+                g_pool_uploads_deferred.fetch_add(1, std::memory_order_relaxed);
+                if (i >= pool_from) pool_hold(t);
+                continue;
+            }
+            const auto t0 = slice ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            tex_ensure_current(t, uf);
+            tex_transition(t, uf, tex_sampled_layout(t));
+            note_early_upload();
+            if (slice) spent += std::chrono::steady_clock::now() - t0;
+        }
+    };
+    if (inline_n == 0 && need_storage.empty()) {           // all of it went early: no pass break
+        run_early();
+        gstamp("uploads/layouts");
+        return;
+    }
     // layout changes and uploads follow: each carries the dependency for its own image. The pass is ended on one of three lines, so the
     // "pass ends by caller" counts (gpustats, test-route scenes) tell the reasons apart: an upload of CPU data, a storage image, or only a
     // layout change (a render target sampled after it was drawn into).
     bool upload = false;
-    for (Texture* t : need) upload = upload || !t->gpu || t->cpu_dirty.load(std::memory_order_relaxed);
-    if (!upload && need_storage.empty() && P.open && prep_ahead_on()) {
+    for (size_t i = 0; i < need.size(); ++i)
+        if (!early[i]) upload = upload || !need[i]->gpu || need[i]->cpu_dirty.load(std::memory_order_relaxed);
+    if (!upload && need_storage.empty() && P.open && prep_ahead_on() && inline_n == need.size()) {
         // the pass is split only for these layout changes: remember them for the next pass on the same targets
         const uint64_t key = target_key(P.ncolor, P.color, P.depth);
         if (g_prep_ahead.size() < kPrepAheadKeys || g_prep_ahead.count(key)) {
@@ -1838,7 +1878,9 @@ void prepare_textures(const ProgLayout& pl) {
     else if (!need_storage.empty()) end_pass(true);   // reason: storage image
     else end_pass(true);                    // reason: layout change only
     counters().pass_breaks.fetch_add(1, std::memory_order_relaxed);
+    run_early();
     for (size_t i = 0; i < need.size(); ++i) {
+        if (early[i]) continue;
         Texture* t = need[i];
         const bool slice = budgeted(t, i);
         if (slice && spent >= cap) {

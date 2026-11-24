@@ -90,6 +90,13 @@ struct Slot {
     uint64_t frame = 0;                   // [prof] gpu_stats: presents counted when the submission was recorded (the frame it belongs to)
     // split_submission: command buffers of this slot's pool already handed to the GPU in this submission, and free ones (all reset with the pool)
     std::vector<VkCommandBuffer> split_used, split_free;
+    // [nvn] early_uploads: a command buffer of its own pool that goes to the GPU just before this submission's own (up_pool: the render
+    // thread begins and ends it while the recording worker may be recording into `cb`, and command buffers of one pool need external sync).
+    // Begun at the start of each submission; handed in front of `cb` only when something was recorded into it (up_used).
+    VkCommandPool up_pool = VK_NULL_HANDLE;
+    VkCommandBuffer up_cb = VK_NULL_HANDLE;
+    bool up_open = false;                 // begun, not ended: early uploads may go into it
+    bool up_used = false;                 // something was recorded: ended and submitted in front of `cb`
 };
 
 // [prof] gpu_stats = N: every N frames one log line (nvn.gpustats) with the GPU time per frame (the sum of each submission's first-to-last
@@ -411,6 +418,14 @@ bool create_slot(Slot& s) {
     ai.commandBufferCount = 1;
     if (vkAllocateCommandBuffers(d.device(), &ai, &s.cb) != VK_SUCCESS) return false;
     vk_gauge_command_buffers().add(1);
+    if (early_uploads_on()) {     // no upload command buffer: early uploads are simply off for the slot
+        if (vkCreateCommandPool(d.device(), &ci, nullptr, &s.up_pool) == VK_SUCCESS) {
+            vk_gauge_command_pools().add(1);
+            ai.commandPool = s.up_pool;
+            if (vkAllocateCommandBuffers(d.device(), &ai, &s.up_cb) == VK_SUCCESS) vk_gauge_command_buffers().add(1);
+            else s.up_cb = VK_NULL_HANDLE;
+        }
+    }
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     if (d.create_buffer(kUploadBytes, usage, gfx::MemoryUse::Upload, &s.upload, "nvn upload") != VK_SUCCESS) return false;
@@ -436,14 +451,30 @@ VkDescriptorPool new_dpool() {
     return p;
 }
 
+// [nvn] early_uploads: ends a slot's upload command buffer. One barrier at its end makes its copies and layout changes visible to everything
+// after it in the queue (the submission's own command buffer comes next).
+void end_upload_cb(Slot& s) {
+    memory_barrier(s.up_cb);
+    vkEndCommandBuffer(s.up_cb);
+}
+
 // Hands the recorded submissions of the batch to the GPU in one vkQueueSubmit2, in recording order, signalling the timeline with the last
 // serial (the earlier ones of the batch complete with it). Every kernel submission costs a pass over all memory the device holds: on Linux
 // (Proton, RADV) the multi-gigabyte host-memory pool imports are user pages the kernel looks up again on each one, about 2 ms a
 // submission on a Legion Go S, so 11 submissions a frame took 20 of its 25 ms. Render thread.
 void flush_batch() {
     if (g->batch.empty()) return;
-    std::vector<VkCommandBufferSubmitInfo> cbi(g->batch.size(), VkCommandBufferSubmitInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO});
-    for (size_t i = 0; i < g->batch.size(); i++) cbi[i].commandBuffer = g->batch[i]->cb;
+    std::vector<VkCommandBufferSubmitInfo> cbi;
+    cbi.reserve(g->batch.size() * 2);
+    for (Slot* b : g->batch) {
+        VkCommandBufferSubmitInfo c = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        if (b->up_used) {             // the early uploads first
+            c.commandBuffer = b->up_cb;
+            cbi.push_back(c);
+        }
+        c.commandBuffer = b->cb;
+        cbi.push_back(c);
+    }
     const uint64_t serial = g->batch.back()->serial;
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     sig.semaphore = g->timeline;
@@ -505,11 +536,19 @@ bool split_submission(Frame& f) {
         s.split_free.push_back(next);
         return false;
     }
-    VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
-    cbi.commandBuffer = s.cb;
+    // early uploads recorded so far go in front of this part; the rest of the submission records its uploads inline (the upload command
+    // buffer is pending now and cannot be begun again before the slot's pool is reset)
+    VkCommandBufferSubmitInfo cbis[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
+    uint32_t ncb = 0;
+    if (s.up_open && s.up_used) {     // (an upload command buffer with nothing in it yet stays open for the rest of the submission)
+        s.up_open = s.up_used = false;
+        end_upload_cb(s);
+        cbis[ncb++].commandBuffer = s.up_cb;
+    }
+    cbis[ncb++].commandBuffer = s.cb;
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    si.commandBufferInfoCount = 1;
-    si.pCommandBufferInfos = &cbi;
+    si.commandBufferInfoCount = ncb;
+    si.pCommandBufferInfos = cbis;
     VkResult r;
     {
         NXFT("split.submit");
@@ -539,6 +578,31 @@ bool split_submission(Frame& f) {
 }
 
 uint64_t split_count() { return g_splits.load(std::memory_order_relaxed); }
+
+// ---- early uploads ([nvn] early_uploads) ----------------------------------------------------------------------------------
+bool early_uploads_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "early_uploads", true);
+    return on;
+}
+
+namespace {
+std::atomic<uint64_t> g_early_uploads{0};
+const bool g_early_hitch = (nxrt::hitch_add_counter("early_uploads", []() -> uint64_t { return g_early_uploads.load(std::memory_order_relaxed); }), true);
+}  // namespace
+
+bool upload_frame(const Frame& f, Frame* out) {
+    if (!g || !f.slot || !on_render_thread()) return false;
+    Slot& s = *static_cast<Slot*>(f.slot);
+    if (!s.up_open || !s.up_cb) return false;
+    *out = f;
+    out->cb = s.up_cb;
+    out->split_ok = false;
+    s.up_used = true;
+    return true;
+}
+
+void note_early_upload() { g_early_uploads.fetch_add(1, std::memory_order_relaxed); }
+uint64_t early_upload_count() { return g_early_uploads.load(std::memory_order_relaxed); }
 
 namespace {
 
@@ -740,6 +804,8 @@ Slot& acquire_slot() {
     s.gp_labels.clear();
     retire();
     vkResetCommandPool(g->dev->device(), s.pool, 0);
+    if (s.up_pool) vkResetCommandPool(g->dev->device(), s.up_pool, 0);
+    s.up_open = s.up_used = false;
     if (!s.split_used.empty()) {     // the reset made them free again; the slot's own cb is whichever was current at the end
         s.split_free.insert(s.split_free.end(), s.split_used.begin(), s.split_used.end());
         s.split_used.clear();
@@ -1229,6 +1295,10 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s.cb, &bi);
+    // [nvn] early_uploads: the upload command buffer is begun here, before the recording worker takes over, so no wait for it is needed
+    // later; a signalled submission only (the debug path's waits know nothing of it)
+    s.up_open = s.up_used = false;
+    if (s.up_cb && !unsignalled && early_uploads_on()) s.up_open = vkBeginCommandBuffer(s.up_cb, &bi) == VK_SUCCESS;
     // [nvn] replay_threads = 2: from here to vkEndCommandBuffer the Vulkan calls of this thread are made by the worker (nvn_cmdq.h)
     std::optional<cmdq::Scope> qscope;
     qscope.emplace();
@@ -1266,6 +1336,10 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
             s.split_free.insert(s.split_free.end(), s.split_used.begin(), s.split_used.end());
             s.split_used.clear();
         }
+        if (s.up_pool) {             // its uploads are dropped with the rest: the textures stay marked as uploaded, as the inline ones do
+            vkResetCommandPool(g->dev->device(), s.up_pool, 0);
+            s.up_open = s.up_used = false;
+        }
         f.cb = s.cb;
         vkBeginCommandBuffer(s.cb, &bi);
         s.timed = false;
@@ -1277,6 +1351,11 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
     if (g->qpool && !aborted) vkCmdWriteTimestamp(s.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g->qpool, qi + 1);
     qscope.reset();       // every queued call made
     vkEndCommandBuffer(s.cb);
+    if (s.up_open) {
+        s.up_open = false;
+        if (s.up_used) end_upload_cb(s);
+        else vkEndCommandBuffer(s.up_cb);    // nothing in it: ended, not submitted (the pool reset frees it)
+    }
     if (!unsignalled) {
         s.serial = serial;
         g->submitted = serial;
@@ -1341,7 +1420,10 @@ bool take_batch_for_present(std::vector<VkCommandBuffer>* cmds, gfx::Renderer::S
         return false;
     }
     cmds->clear();
-    for (Slot* s : g->batch) cmds->push_back(s->cb);
+    for (Slot* s : g->batch) {
+        if (s->up_used) cmds->push_back(s->up_cb);   // [nvn] early_uploads: in front of its submission
+        cmds->push_back(s->cb);
+    }
     p->cmds = cmds->data();
     p->count = static_cast<uint32_t>(cmds->size());
     p->timeline = g->timeline;
@@ -1878,6 +1960,11 @@ void tear_down() {
             vk_gauge_descriptor_pools().sub(1);
         }
         d.destroy_buffer(s.upload);
+        if (s.up_pool) {
+            vkDestroyCommandPool(d.device(), s.up_pool, nullptr);
+            vk_gauge_command_pools().sub(1);
+            if (s.up_cb) vk_gauge_command_buffers().sub(1);
+        }
         if (s.pool) {
             vkDestroyCommandPool(d.device(), s.pool, nullptr);
             vk_gauge_command_pools().sub(1);

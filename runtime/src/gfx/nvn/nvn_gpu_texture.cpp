@@ -3227,6 +3227,12 @@ bool tex_first_upload_deferrable(Texture* t) {
     return !g->failed && !g->uploaded && !g->gpu_written && !g->depth && !g->promoted && g->scale == 1.0f;
 }
 
+bool tex_early_upload_ok(Texture* t) {
+    if (!tex_first_upload_deferrable(t) || !t->mem || t->vpool) return false;
+    const TexGpu* g = t->gpu;
+    return !g || (!g->sparse && g->layout == VK_IMAGE_LAYOUT_UNDEFINED);
+}
+
 bool tex_first_upload_uncompressed_deferrable(Texture* t) {
     if (!t || !t->fmt || t->fmt->astc || t->fmt->bc || t->fmt->compressed || !t->mem || t->is_display || !t->cpu_dirty.load(std::memory_order_relaxed)) return false;
     const TexGpu* g = t->gpu;
