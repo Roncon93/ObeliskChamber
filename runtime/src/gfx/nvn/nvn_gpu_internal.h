@@ -115,6 +115,9 @@ bool early_uploads_on();
 // A Frame of the same submission (slot, serial, staging, defer) whose cb is the upload command buffer. False when there is none (feature
 // off, no slot, the debug path, or the buffer went to the GPU with a split part already): record inline then.
 bool upload_frame(const Frame& f, Frame* out);
+// [gfx] async_compute: the submission f belongs to reads what the async queue wrote up to timeline value `value` of `sem` (one semaphore);
+// its vkQueueSubmit2 waits for it. The highest value asked for wins.
+void frame_wait_async(Frame& f, VkSemaphore sem, uint64_t value);
 void note_early_upload();          // counts one texture uploaded there (hitch line "early_uploads", gpustats)
 uint64_t early_upload_count();
 
