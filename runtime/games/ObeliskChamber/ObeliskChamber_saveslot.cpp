@@ -602,6 +602,29 @@ uint64_t save_root() {
     if (!rd(g_save_item + 0x8, &item_menu) || !item_menu) return 0;
     return rd(item_menu + 0x98, &root) && root ? root : item_menu;
 }
+// [fefw] load_ends_game (default on; issue #187): a load from the + menu first ends the running game's context the way the + menu's Return
+// to Title does. The game manager ([main+0x2231908], G) keeps contexts of 0x170 bytes from G+0x10c; Return to Title's Yes (0x188dc80),
+// when context 4 is live (G+0x6dc, its +0x11c), sets G+0x10 = 0 and G+8 = 4 before asking for the title (main sequence 14), and the
+// game's end (0x665dd0) then winds up context G+8 (0x8b3d20). The Continue prompt's Yes (0x16dd880) is written for the title, where no
+// context is live: it asks for the load (main sequence 32) and leaves G+8 at 0, so from the + menu context 4 was never wound up. Its
+// leftovers lasted until the game was closed (after it, X no longer opened the details box in Information and Roster, even after Return
+// to Title and Continue; seen on a PC).
+constexpr uint64_t kGameMgr = 0x2231908;
+constexpr uint64_t kGameCtx = 8, kGameCtxFlag = 0x10, kGameCtx4Live = 0x6dc;
+void end_game_context() {
+    static const bool on = config_get_bool("fefw", "load_ends_game", true);
+    uint64_t g = 0;
+    uint32_t live = 0;
+    // (0x188dc80, Return to Title's Yes, is where this was read from: on another build the offsets are not trusted)
+    if (!on || !fn_lookup(g_base + 0x188dc80) || !rd(g_base + kGameMgr, &g) || !g || !rd(g + kGameCtx4Live, &live)) return;
+    if (!live) {
+        NXLOG_I(kTag, "Load: no game context to end (context 4 is not live)");
+        return;
+    }
+    wr<uint8_t>(g + kGameCtxFlag, 0);
+    wr<uint32_t>(g + kGameCtx, 4);
+    NXLOG_I(kTag, "Load: the running game's context 4 is ended first, as Return to Title does ([fefw] load_ends_game)");
+}
 // The slot becomes the one in use and the game is asked to load its Auto file (what the Continue prompt's Yes does).
 void load_now(::Ctx* c, const std::string& slot, uint64_t root, uint64_t seq) {
     {
@@ -611,6 +634,7 @@ void load_now(::Ctx* c, const std::string& slot, uint64_t root, uint64_t seq) {
         set_active(slot);
         NXLOG_I(kTag, "Load: slot %s in use, asking the main sequence for a load", slot.c_str());
     }
+    end_game_context();
     call(c, g_base + kPendingLoad, {2, 0xffffffffull, 0});
     call(c, g_base + kProcEnd, {root});
     wr<uint32_t>(seq + 0x98, kSeqLoad);
@@ -669,6 +693,7 @@ void prompt_yes(::Ctx* c) {
         }
         g_load_slot.clear();
     }
+    if (from_list) end_game_context();
     pass(c, g_base + kPromptYes);
     // On the world map the load the game just asked for waited until the slot list was closed by hand (seen on a PC): close it here.
     if (from_list) {
