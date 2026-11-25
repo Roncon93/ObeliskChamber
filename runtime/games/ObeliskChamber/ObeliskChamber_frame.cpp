@@ -640,9 +640,17 @@ void anim_move_wrap(::Ctx* c) {
 // The test: the manager that steps them (0x1940d60, called only through a pointer) gets its clock step ([+0x48] + 0x68, frames of
 // 1/59.94 s) as 0 on frames with no 30 Hz step in them and the frames since the last one on frames with one, so every skeleton steps
 // on the same frames, as at 30 fps. The clock's step is put back after the call.
+// That alone left the eyes wrong (checked on a PC): on frames where a skeleton does not step, the wrapper still calls
+// spine::AnimationState::update(0.0001) without an apply. When the game starts an animation with no mix (the blink:
+// BindFaceEyeBlinkSync sets mixDuration 0) on such a frame, that update gives the new entry a mix time above 0, so Spine drops the
+// entry it replaces as finished mixing before it was ever applied mixing out, and what that entry had set (attachments: the open
+// eye's images) is never reset, while the blink moves the lids. At 30 fps every call steps, so an apply always comes first.
+// skip (the default): on frames with no 30 Hz step the manager is not called at all, so each skeleton is called once per 30 Hz step,
+// as at 30 fps; step: the manager is called with a clock step of 0 between steps (the first test); off.
 constexpr uint32_t kSpineManager = 0x1940d60;
 GuestFn g_spine_orig = nullptr;
 bool g_spine_lock = false;
+bool g_spine_skip = true;   // [fefw] spine_lock = skip
 std::mutex g_spine_mu;
 std::unordered_map<uint64_t, float> g_spine_acc;   // manager -> clock frames held back since its last 30 Hz step; under g_spine_mu
 std::atomic<uint64_t> g_spine_held{0}, g_spine_steps{0};
@@ -662,6 +670,11 @@ void spine_mgr_wrap(::Ctx* c) {
         acc += step;
         if (st().tick.load(std::memory_order_relaxed)) use = acc, acc = 0.f;
     }
+    if (g_spine_skip && use == 0.f) {   // no 30 Hz step in this frame: the manager is not called
+        g_spine_held.fetch_add(1, std::memory_order_relaxed);
+        count(kAnim);
+        return;
+    }
     std::memcpy(reinterpret_cast<void*>(clock + 0x68), &use, 4);
     g_spine_orig(c);
     float now = 0.f;
@@ -672,7 +685,10 @@ void spine_mgr_wrap(::Ctx* c) {
 void spine_try_install() {
     static std::atomic<bool> tried{false};
     if (tried.exchange(true)) return;
-    g_spine_lock = config_get_bool("fefw", "spine_lock", true);
+    const std::string m = config_get_str("fefw", "spine_lock", "skip");
+    g_spine_lock = m != "off" && m != "false" && m != "0";
+    g_spine_skip = m == "skip" || m == "true" || m == "1";
+    if (g_spine_lock && !g_spine_skip && m != "step") NXLOG_W(kTag, "[fefw] spine_lock = %s: not skip, step or off, step is used", m.c_str());
     if (!g_spine_lock) return;
     const uint64_t at = st().base + kSpineManager;
     if (!(g_spine_orig = fn_lookup(at))) {
@@ -681,7 +697,7 @@ void spine_try_install() {
         return;
     }
     fn_register(at, &spine_mgr_wrap);
-    NXLOG_I(kTag, "spine: [fefw] spine_lock on: the Spine skeletons (talk portraits) step together on the 30 Hz steps (issue #205)");
+    NXLOG_I(kTag, "spine: [fefw] spine_lock = %s: the Spine skeletons (talk portraits) step together on the 30 Hz steps%s (issue #205)", g_spine_skip ? "skip" : "step", g_spine_skip ? ", and are not called between them" : "");
 }
 void spine_log() {   // from frame_step, every 10 s
     static auto last = std::chrono::steady_clock::now();
