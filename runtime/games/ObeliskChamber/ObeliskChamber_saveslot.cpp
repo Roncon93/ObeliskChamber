@@ -605,7 +605,8 @@ uint64_t save_root() {
     if (!rd(g_save_item + 0x8, &item_menu) || !item_menu) return 0;
     return rd(item_menu + 0x98, &root) && root ? root : item_menu;
 }
-// [fefw] load_via_title (default on; issue #187): a Load from the + menu goes through the title, as the game's own Return to Title and
+// [fefw] load_via_title (default off; issue #187, an earlier attempt kept for testing; the cause was the details box block counter, see
+// [fefw] help_unblock in ObeliskChamber_optmenu.cpp): a Load from the + menu goes through the title, as the game's own Return to Title and
 // Continue do. Loading from inside the running game (the Continue prompt's Yes, 0x16dd880, written for the title: request 32) left the
 // game manager's contexts 6, 7 and 8 ([main+0x2231908] + i*0x170, live word +0x11c) running from the old game, and X no longer opened the
 // details box in Information and Roster until the game was closed. The in-game load (request 35) and marking context 6 to end did not
@@ -618,7 +619,7 @@ constexpr uint64_t kReturnToTitleYes = 0x188e120, kReportWindow = 0x22a10c0, kRe
 constexpr auto kTitleLoadWait = std::chrono::minutes(2);
 Clock::time_point g_title_load_at;
 bool load_via_title_on() {
-    static const bool on = config_get_bool("fefw", "load_via_title", true);
+    static const bool on = config_get_bool("fefw", "load_via_title", false);
     return on;
 }
 bool title_load_waiting() {
