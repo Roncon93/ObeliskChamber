@@ -33,6 +33,15 @@ struct OpenPad {
 };
 std::vector<OpenPad> g_pads;
 
+// Gamepad rescan. Under Proton (Wine) SDL reports a pad that goes away but never one that comes back: Steam's new virtual
+// pad for a controller turned on again never raised SDL_EVENT_GAMEPAD_ADDED, so the game lost the controller until it was
+// restarted. While no pad is open and one was open earlier in this run, pump_events looks again every [gfx] pad_rescan_s
+// seconds: first SDL's own list, then a restart of the joystick subsystem, which enumerates the devices from scratch.
+bool g_gamepads_on = false;   // the joystick and gamepad subsystems were initialised
+bool g_had_pad = false;       // a pad was open at some point in this run
+Uint64 g_next_rescan_ms = 0;
+int g_rescans = 0;
+
 input::Event make_event(input::EventType type, uint64_t ts) {
     input::Event e;
     e.type = type;
@@ -146,6 +155,7 @@ void gamepad_opened(SDL_JoystickID id, uint64_t ts) {
         return;
     }
     g_pads.push_back({id, pad});
+    g_had_pad = true;
 
     input::GamepadInfo info;
     info.id = id;
@@ -351,6 +361,7 @@ bool init(const InitOptions& opt) {
     }
     g_inited = true;
     g_quit = false;
+    g_gamepads_on = opt.gamepads;
     const int v = SDL_GetVersion();
     NXLOG_I(kTag, "SDL %d.%d.%d initialised (gamepads %s)", SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v),
             SDL_VERSIONNUM_MICRO(v), opt.gamepads ? "on" : "off");
@@ -590,6 +601,53 @@ bool relative_mouse_is_raw() {
 
 // ---- events -------------------------------------------------------------------------------------------------------
 
+namespace {
+
+// Opens the pads SDL lists that are not open here yet; returns how many it opened.
+int open_listed_pads() {
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    const size_t before = g_pads.size();
+    for (int i = 0; ids && i < count; ++i) gamepad_opened(ids[i], SDL_GetTicksNS());
+    SDL_free(ids);
+    return static_cast<int>(g_pads.size() - before);
+}
+
+// See g_had_pad: looks for a pad again while none is open after one was lost.
+void rescan_gamepads() {
+    if (!g_gamepads_on || !g_had_pad || !g_pads.empty()) return;
+    static const int64_t interval_s = config_get_int("gfx", "pad_rescan_s", 3);
+    if (interval_s <= 0) return;
+    const Uint64 now = SDL_GetTicks();
+    if (now < g_next_rescan_ms) return;
+    g_next_rescan_ms = now + static_cast<Uint64>(interval_s) * 1000;
+
+    if (open_listed_pads() > 0) {
+        NXLOG_I(kTag, "gamepad rescan: SDL listed a pad it had not announced");
+        return;
+    }
+    // The pad events of the old subsystem are dropped with it; the new one announces what it finds.
+    const Uint64 t0 = SDL_GetTicksNS();
+    SDL_QuitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK);
+    SDL_FlushEvents(SDL_EVENT_JOYSTICK_AXIS_MOTION, SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED);
+    if (!SDL_InitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
+        NXLOG_W(kTag, "gamepad rescan: joystick subsystem restart failed: %s (rescans off)", SDL_GetError());
+        g_gamepads_on = false;
+        return;
+    }
+    const int opened = open_listed_pads();
+    const double ms = static_cast<double>(SDL_GetTicksNS() - t0) / 1e6;
+    ++g_rescans;
+    if (opened > 0) {
+        NXLOG_I(kTag, "gamepad rescan %d: joystick subsystem restarted in %.1f ms, %d pad(s) found", g_rescans, ms, opened);
+    } else if (g_rescans <= 3 || g_rescans % 100 == 0) {
+        NXLOG_I(kTag, "gamepad rescan %d: joystick subsystem restarted in %.1f ms, no pad yet (every %lld s while none is open)",
+                g_rescans, ms, static_cast<long long>(interval_s));
+    }
+}
+
+}  // namespace
+
 int pump_events(bool wait, int timeout_ms) {
     if (!g_inited) return 0;
     SDL_Event ev;
@@ -605,6 +663,7 @@ int pump_events(bool wait, int timeout_ms) {
         translate(ev);
         have = SDL_PollEvent(&ev);
     }
+    rescan_gamepads();
     return handled;
 }
 
