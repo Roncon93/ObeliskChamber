@@ -943,8 +943,8 @@ void tab_label(::Ctx* c) {
 
 // [fefw] help_unblock (default on; issue #187). The X details box (FloatingHelp, [main+0x2231f30]) opens only while the counter at
 // +0xfc is 0 (0x18e44c0). The game's menu OnInit (slot 84, 0x16a4620, copied by menu_init) adds 1 and its close (slot 94, 0x16a4790)
-// takes it back. A Load from the pick list ends the game with the list still open, and its close never runs (seen on a PC with
-// [fefw] diag_help: the list took the block 0 -> 1 and no close or end of it was seen before or after the load), so the block stayed 1
+// takes it back. A Load from the pick list ends the game with the list still open, and its close never runs (seen on a PC: the
+// list took the block 0 -> 1 and neither its close nor its end ran at the load), so the block stayed 1
 // and X did nothing until the game was closed. We remember the count each of our menus holds and give it back when a Load from the
 // list goes ahead (optmenu_release_help). If the game does close such a menu after that, its own take-back is undone so it is not
 // taken twice.
@@ -978,8 +978,6 @@ void menu_close(::Ctx* c) {
     const int32_t after = help_block();
     uint64_t fh = 0;
     if (released && after < before && rd(g_base + kUiCount, &fh) && fh) wr<int32_t>(fh + 0xfc, before);
-    NXLOG_I(kTag, "menu %llx closed: details box block %d -> %d%s", static_cast<unsigned long long>(menu), before,
-            released ? before : after, released ? " (already given back at the Load)" : "");
 }
 
 // slot 84, the game's OnInit with our label function (its own reads a table of three message ids)
@@ -1003,8 +1001,6 @@ void menu_init(::Ctx* c) {
     int32_t count = 0;
     if (rd(g_base + kUiCount, &counter) && counter && rd(counter + 0xfc, &count)) {
         wr<int32_t>(counter + 0xfc, std::max(count, -1) + 1);
-        NXLOG_I(kTag, "menu %llx (%s) opened: details box block %d -> %d", static_cast<unsigned long long>(menu), is_list_menu(menu) ? "list" : "options",
-                count, std::max(count, -1) + 1);
         if (help_fix_on()) help_hold(menu);
     }
 }

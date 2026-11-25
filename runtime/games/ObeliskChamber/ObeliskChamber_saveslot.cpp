@@ -377,8 +377,6 @@ void title_continue_note(uint64_t item) {
     g_tc_menu = menu;
     g_tc_item = item;
 }
-std::string g_title_load;            // [fefw] load_via_title: the slot to load when the title menu comes (game thread)
-bool title_load_frame(uint64_t menu, uint64_t item);
 void title_continue_frame() {
     if (++g_tc_idle > 30) g_tc_done_menu = g_tc_done_item = 0;
     if (!g_tc_menu) return;
@@ -386,7 +384,6 @@ void title_continue_frame() {
     g_tc_menu = g_tc_item = 0;
     g_tc_done_menu = menu;
     g_tc_done_item = item;
-    if (title_load_frame(menu, item)) return;
     uint64_t cur = 0;
     uint8_t selectable = 0;
     if (!rd(menu + kMenuCurrent, &cur) || kind_of(cur) != kNewGame || kind_of(item) != kContinue) return;
@@ -605,92 +602,6 @@ uint64_t save_root() {
     if (!rd(g_save_item + 0x8, &item_menu) || !item_menu) return 0;
     return rd(item_menu + 0x98, &root) && root ? root : item_menu;
 }
-// [fefw] load_via_title (default off; issue #187, an earlier attempt kept for testing; the cause was the details box block counter, see
-// [fefw] help_unblock in ObeliskChamber_optmenu.cpp): a Load from the + menu goes through the title, as the game's own Return to Title and
-// Continue do. Loading from inside the running game (the Continue prompt's Yes, 0x16dd880, written for the title: request 32) left the
-// game manager's contexts 6, 7 and 8 ([main+0x2231908] + i*0x170, live word +0x11c) running from the old game, and X no longer opened the
-// details box in Information and Roster until the game was closed. The in-game load (request 35) and marking context 6 to end did not
-// help either. The + menu's Return to Title Yes (0x188e120: fade, the + menu ends, main sequence request 1) ends 6, 7 and 8, and a
-// Continue from the title starts them again (seen on a PC with [fefw] diag_ctx). So Yes on the Load prompt makes the slot the one in
-// use, closes the prompt's save report as the game's Yes does (0x1618dc0 on [main+0x22a10c0]), and runs that Return to Title Yes with
-// the + menu's Save entry where it reads its entry (its x1 points at it). The next time the title menu draws a selectable Continue
-// (within two minutes) the slot is loaded by the title Continue prompt's own Yes, with no second prompt (title_load_frame). `false`: the load from inside the game, as before.
-constexpr uint64_t kReturnToTitleYes = 0x188e120, kReportWindow = 0x22a10c0, kReportClose = 0x1618dc0;
-constexpr auto kTitleLoadWait = std::chrono::minutes(2);
-Clock::time_point g_title_load_at;
-bool load_via_title_on() {
-    static const bool on = config_get_bool("fefw", "load_via_title", false);
-    return on;
-}
-bool title_load_waiting() {
-    if (g_title_load.empty()) return false;
-    if (Clock::now() - g_title_load_at <= kTitleLoadWait) return true;
-    NXLOG_W(kTag, "Load: the title menu did not come within two minutes; slot %s stays in use but is not loaded", g_title_load.c_str());
-    g_title_load.clear();
-    return false;
-}
-// The slot (already the one in use) goes through the title; false when this build's functions are not the ones read, and the load
-// goes on from inside the game as before.
-bool load_via_title(::Ctx* c, const std::string& slot) {
-    if (!load_via_title_on() || !g_save_item || kind_of(g_save_item) != kSave || !save_root() || !fn_lookup(g_base + kReturnToTitleYes) ||
-        !fn_lookup(g_base + kReportClose))
-        return false;
-    uint64_t report = 0;
-    if (rd(g_base + kReportWindow, &report) && report) call(c, g_base + kReportClose, {report});
-    static uint64_t entry;            // static: the game may keep the pointer past this call
-    entry = g_save_item;
-    g_title_load = slot;
-    g_title_load_at = Clock::now();
-    NXLOG_I(kTag, "Load: slot %s goes through the title, as Return to Title and Continue do ([fefw] load_via_title)", slot.c_str());
-    c->x[0] = call(c, g_base + kReturnToTitleYes, {0, reinterpret_cast<uint64_t>(&entry)});
-    return true;
-}
-void load_now(::Ctx* c, const std::string& slot, uint64_t root, uint64_t seq);
-// Saveslot_frame, the first frame a title menu draws a selectable Continue: the load is armed, and kTitleLoadFrames frames later
-// (title_load_tick) the slot is loaded by the title Continue prompt's own Yes (0x16dd880: fade, the save report closes, pending load
-// 2, -1, the menu's root ends, request 32), given an object whose +8 is the title menu's root as the prompt's own is. A first version
-// loaded at once with the pieces of that Yes (load_now) and X still failed afterwards, while Return to Title and a Continue by hand
-// worked.
-constexpr int kTitleLoadFrames = 60;
-uint64_t g_tl_menu = 0, g_tl_item = 0;
-int g_tl_wait = 0;
-bool title_load_frame(uint64_t menu, uint64_t item) {
-    if (!title_load_waiting()) return false;
-    uint8_t selectable = 0;
-    if (kind_of(item) != kContinue || !rd(item + 0x51, &selectable) || !selectable) return false;
-    g_tl_menu = menu;
-    g_tl_item = item;
-    g_tl_wait = kTitleLoadFrames;
-    return true;
-}
-void title_load_tick() {
-    if (g_tl_wait <= 0 || --g_tl_wait > 0) return;
-    const uint64_t menu = g_tl_menu, item = g_tl_item;
-    g_tl_menu = g_tl_item = 0;
-    const std::string slot = g_title_load;
-    g_title_load.clear();
-    uint64_t root = 0, cur = 0;
-    if (slot.empty() || kind_of(item) != kContinue || !rd(menu + kMenuCurrent, &cur)) {
-        NXLOG_W(kTag, "Load: the title menu went away before slot %s was loaded", slot.c_str());
-        return;
-    }
-    if (!rd(menu + 0x98, &root) || !root) root = menu;           // the title's Continue: the menu's root, else the menu (0x16d4ae0)
-    ::Ctx* c = kernel::current_ctx();
-    if (!c) return;
-    {
-        std::lock_guard<std::mutex> lk(g_mu);
-        if (!has_save(slot)) {
-            NXLOG_W(kTag, "Load: slot %s has no save any more; the title stays", slot.c_str());
-            return;
-        }
-        set_active(slot);
-    }
-    static uint64_t yes[2];           // static: the game may keep the pointer past this call
-    yes[0] = 0;
-    yes[1] = root;
-    NXLOG_I(kTag, "Load: the title is up, slot %s is loaded by the title Continue prompt's own Yes", slot.c_str());
-    call(c, g_base + kPromptYes, {reinterpret_cast<uint64_t>(yes)});
-}
 // The slot becomes the one in use and the game is asked to load its Auto file (what the Continue prompt's Yes does).
 void load_now(::Ctx* c, const std::string& slot, uint64_t root, uint64_t seq) {
     {
@@ -716,17 +627,7 @@ uint32_t load_direct(::Ctx* c, int i, const std::string& slot) {
     }
     g_load_armed = -1;
     if (!rd(g_base + kMainSeq, &seq) || !seq || !mem::is_mapped(seq + 0x98, 4)) return kPickRefused;
-    {
-        std::lock_guard<std::mutex> lk(g_mu);
-        g_pending = kPendNone;
-        g_before_new.clear();
-        set_active(slot);
-    }
     optmenu_release_help();
-    if (load_via_title(c, slot)) {
-        optmenu_close_list(c);
-        return kPickNothing;
-    }
     load_now(c, slot, root, seq);
     return kPickNothing;
 }
@@ -769,12 +670,7 @@ void prompt_yes(::Ctx* c) {
         }
         g_load_slot.clear();
     }
-    std::string slot;
-    {
-        std::lock_guard<std::mutex> lk(g_mu);
-        slot = g_active;
-    }
-    if (!from_list || !load_via_title(c, slot)) pass(c, g_base + kPromptYes);
+    pass(c, g_base + kPromptYes);
     // On the world map the load the game just asked for waited until the slot list was closed by hand (seen on a PC): close it here.
     if (from_list) {
         const uint64_t answer = c->x[0];
@@ -873,71 +769,7 @@ void saveslot_install(uint64_t base) {
 }
 
 // Main thread, once per frame: hooks the entries once the game's data is there and is the build the addresses are for.
-constexpr uint64_t kGameMgr = 0x2231908, kGameCtx = 8, kGameCtxFlag = 0x10, kCtxSize = 0x170, kCtxLive = 0x11c;
-// [fefw] diag_ctx (issue #187, a test switch, on while #187 is tested): each time the set of live game-manager contexts (G + i*0x170 + 0x11c,
-// i < 16), the context asked to end (G+8, G+0x10) or the main sequence's request (+0x98) changes, one line says so (at most 200 a run).
-// Compared between a session that loads from the title and one that loads from the + menu.
-void diag_ctx() {
-    static const bool on = config_get_bool("fefw", "diag_ctx", true);
-    static int lines = 0;
-    static std::string last;
-    if (!on || lines >= 200 || !g_base) return;
-    uint64_t g = 0, seq = 0;
-    uint32_t state = 0xffffffffu, pending = 0;
-    uint8_t flag = 0;
-    if (rd(g_base + kMainSeq, &seq) && seq) rd(seq + 0x98, &state);
-    std::string now = "seq " + std::to_string(state);
-    if (rd(g_base + kGameMgr, &g) && g) {
-        rd(g + kGameCtx, &pending);
-        rd(g + kGameCtxFlag, &flag);
-        now += ", G+8 " + std::to_string(pending) + " G+0x10 " + std::to_string(flag) + ", live:";
-        for (int i = 0; i < 16; ++i) {
-            uint32_t live = 0;
-            if (rd(g + i * kCtxSize + kCtxLive, &live) && live) now += " " + std::to_string(i);
-        }
-    } else {
-        now += ", no game manager";
-    }
-    if (now == last) return;
-    last = now;
-    ++lines;
-    std::string slot;
-    {
-        std::lock_guard<std::mutex> lk(g_mu);
-        slot = g_active;
-    }
-    NXLOG_I(kTag, "ctx: %s (slot %s)", now.c_str(), slot.c_str());
-}
-
-// [fefw] diag_help (issue #187, a test switch, on while #187 is tested): logs the details box's state (FloatingHelp, [main+0x2231f30])
-// each time it changes: what its X handler (0x18e4820) and open check (0x18e44c0) read. +0x98 the help process, +0xa8/+0xb0 its
-// list of help sources (16-byte entries), +0xe0 a weak pointer it reads first, +0xfc the block counter (0 lets it open).
-void diag_help() {
-    static const bool on = config_get_bool("fefw", "diag_help", true);
-    static uint64_t last[7] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
-    if (!on || !g_base) return;
-    uint64_t fh = 0, proc = 0, b = 0, e = 0, weak = 0, weak_word = 0;
-    int32_t count = 0;
-    rd(g_base + 0x2231f30, &fh);
-    if (fh) {
-        rd(fh + 0x98, &proc);
-        rd(fh + 0xa8, &b);
-        rd(fh + 0xb0, &e);
-        rd(fh + 0xe0, &weak);
-        rd(fh + 0xfc, &count);
-        if (weak) rd(weak + 8, &weak_word);
-    }
-    const uint64_t now[7] = {fh, proc, b, e, weak, weak_word, static_cast<uint32_t>(count)};
-    if (std::equal(std::begin(now), std::end(now), std::begin(last))) return;
-    std::copy(std::begin(now), std::end(now), std::begin(last));
-    NXLOG_I(kTag, "help: details box %llx, help process %llx, sources %lld (at %llx), weak %llx (+8: %llx), block %d",
-            static_cast<unsigned long long>(fh), static_cast<unsigned long long>(proc), e >= b ? static_cast<long long>((e - b) / 16) : -1ll,
-            static_cast<unsigned long long>(b), static_cast<unsigned long long>(weak), static_cast<unsigned long long>(weak_word), count);
-}
 void saveslot_frame() {
-    diag_ctx();
-    diag_help();
-    if (g_hooked) title_load_tick();
     if (g_hooked && g_tc_ok) title_continue_frame();
     if (g_hooked || g_failed || !g_on || !g_base) return;
     uint64_t probe = 0;
