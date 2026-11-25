@@ -41,7 +41,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "nxrt/config.h"
 #include "nxrt/dispatch.h"
@@ -483,10 +487,14 @@ void die_cb_wrap(::Ctx* c) {
 constexpr uint32_t kFacialUpdate = 0x10d1920;
 GuestFn g_facial_orig = nullptr;
 std::atomic<int> g_facial_lines{0};
+void face_module_note(uint64_t ctl);
+int g_hold_mode = 0;   // [fefw] face_anim_hold: 0 off, 1 face, 2 all (below)
+bool g_facial_log = false;
 void facial_wrap(::Ctx* c) {
     const uint64_t ctl = c->x[0];
     g_facial_orig(c);
-    if (g_facial_lines.load(std::memory_order_relaxed) >= 3000) return;
+    if (g_hold_mode == 1) face_module_note(ctl);
+    if (!g_facial_log || g_facial_lines.load(std::memory_order_relaxed) >= 3000) return;
     struct Seen { uint64_t ctl; double at; };
     static Seen seen[16] = {};   // main thread
     const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -517,10 +525,98 @@ void facial_wrap(::Ctx* c) {
     NXLOG_I(kTag, "facial: ctl %llx owner %llx step %.3f |%s", static_cast<unsigned long long>(ctl), static_cast<unsigned long long>(owner), step,
             vals.c_str());
 }
+// ---- [fefw] face_anim_hold (issue #205, a test switch) ----------------------------------------------------------------------------------
+// The blink (0x10d2b80, from the controller's update) plays two clips together on anim layers 2 and 3 of the face's
+// wld::AnimLayerCtrlModule ([controller + 0x88]): one for the lids, one for the eyes. Its wld::AnimCtrlModule ([layer module + 0x18],
+// vtable 0x1ffe118) moves each clip's time (slot 4, 0xa89860; per node of 0x68 bytes at +0x48: speed at +8, the time at [+0x10] + 0)
+// by speed x the clock step, in frames of 1/60 s, and the pose is made from those times later in the frame (slot 6). At 30 fps every
+// time the face is drawn at is a 30 fps key; at 60 every other one falls between two keys, so the lids are drawn halfway while what is
+// keyed as on or off (the open eye's parts) is still on. The test: on frames with no 30 Hz step in them the face's clips are drawn at
+// the time of the last 30 Hz step (the real time is put back before the next move), as at 30 fps. face: the modules of the facial
+// controllers only; all: every character's (everything animates at 30, a check only); off.
+constexpr uint32_t kAnimCtrlMove = 0xa89860, kAnimCtrlVtable = 0x1ffe118;
+GuestFn g_anim_move_orig = nullptr;
+struct Held { uint64_t ts; float real, shown, last_tick; };
+std::mutex g_hold_mu;
+std::unordered_set<uint64_t> g_face_modules;                     // under g_hold_mu
+std::unordered_map<uint64_t, std::vector<Held>> g_held;          // module -> its clips' times; under g_hold_mu
+std::atomic<uint64_t> g_hold_count{0};
+void face_module_note(uint64_t ctl) {
+    uint64_t layers = 0, module = 0, vt = 0;
+    if (!vrd(ctl + 0x88, &layers) || !vrd(layers + 0x18, &module) || !vrd(module, &vt) || vt != st().base + kAnimCtrlVtable) return;
+    std::lock_guard<std::mutex> lk(g_hold_mu);
+    if (g_face_modules.insert(module).second && g_face_modules.size() <= 64) {
+        uint64_t b = 0, e = 0;
+        vrd(module + 0x48, &b), vrd(module + 0x50, &e);
+        NXLOG_I(kTag, "facial: face anim module %llx (controller %llx): %llu clip node(s)", static_cast<unsigned long long>(module),
+                static_cast<unsigned long long>(ctl), static_cast<unsigned long long>(e > b ? (e - b) / 0x68 : 0));
+    }
+}
+void anim_move_wrap(::Ctx* c) {
+    const uint64_t module = c->x[0];
+    bool held_module = false;
+    if (g_hold_mode != 0) {
+        std::lock_guard<std::mutex> lk(g_hold_mu);
+        held_module = g_hold_mode == 2 || g_face_modules.count(module);
+        if (held_module) {
+            auto it = g_held.find(module);
+            if (it != g_held.end())
+                for (const Held& h : it->second) {   // put the real time back if the game has not changed it since
+                    float now = 0.f;
+                    if (h.shown != h.real && vrd(h.ts, &now) && now == h.shown) std::memcpy(reinterpret_cast<void*>(h.ts), &h.real, 4);
+                }
+        }
+    }
+    g_anim_move_orig(c);
+    if (!held_module) return;
+    const float s = scale(kAnim);
+    const bool tick = full(s) || st().tick.load(std::memory_order_relaxed);
+    uint64_t b = 0, e = 0;
+    if (!vrd(module + 0x48, &b) || !vrd(module + 0x50, &e) || e < b || (e - b) / 0x68 > 256) return;
+    std::lock_guard<std::mutex> lk(g_hold_mu);
+    if (g_held.size() > 512) g_held.clear();
+    std::vector<Held>& v = g_held[module];
+    std::vector<Held> next;
+    next.reserve((e - b) / 0x68);
+    uint64_t n = 0;
+    for (uint64_t node = b; node + 0x68 <= e; node += 0x68) {
+        uint64_t ts = 0;
+        float t = 0.f;
+        if (!vrd(node + 0x10, &ts) || !vrd(ts, &t)) continue;
+        Held h{ts, t, t, t};
+        for (const Held& o : v)
+            if (o.ts == ts) { h.last_tick = o.last_tick; break; }
+        if (tick) {
+            h.last_tick = t;
+        } else if (h.last_tick != t && std::fabs(t - h.last_tick) < 8.0f) {   // not across a new clip or a loop
+            h.shown = h.last_tick;
+            std::memcpy(reinterpret_cast<void*>(ts), &h.shown, 4);
+            ++n;
+        }
+        next.push_back(h);
+    }
+    v.swap(next);
+    if (n) g_hold_count.fetch_add(n, std::memory_order_relaxed);
+}
 void facial_try_install() {
     static std::atomic<bool> tried{false};
     if (tried.exchange(true)) return;
-    if (!config_get_bool("fefw", "diag_facial", true)) return;
+    {
+        const std::string m = config_get_str("fefw", "face_anim_hold", "face");
+        g_hold_mode = m == "all" ? 2 : m == "off" ? 0 : 1;
+        if (m != "all" && m != "off" && m != "face") NXLOG_W(kTag, "[fefw] face_anim_hold = %s: not off, face or all, face is used", m.c_str());
+        const uint64_t at = st().base + kAnimCtrlMove;
+        if (g_hold_mode && (g_anim_move_orig = fn_lookup(at))) {
+            fn_register(at, &anim_move_wrap);
+            NXLOG_I(kTag, "facial: [fefw] face_anim_hold = %s: %s drawn at the last 30 Hz step's time between steps (issue #205)",
+                    m.c_str(), g_hold_mode == 2 ? "every character's clips" : "the faces' clips");
+        } else if (g_hold_mode) {
+            NXLOG_W(kTag, "facial: [fefw] face_anim_hold: the anim clip move (0x%x) is not in this build", kAnimCtrlMove);
+            g_hold_mode = 0;
+        }
+    }
+    g_facial_log = config_get_bool("fefw", "diag_facial", true);
+    if (!g_facial_log && g_hold_mode != 1) return;
     const uint64_t at = st().base + kFacialUpdate;
     g_facial_orig = fn_lookup(at);
     if (!g_facial_orig) {
@@ -528,7 +624,7 @@ void facial_try_install() {
         return;
     }
     fn_register(at, &facial_wrap);
-    NXLOG_I(kTag, "facial: facial controller logging on ([fefw] diag_facial, issue #205)");
+    if (g_facial_log) NXLOG_I(kTag, "facial: facial controller logging on ([fefw] diag_facial, issue #205)");
 }
 
 // The lifted modules are registered after play mode installs its hooks: wrap the callback at the first frame step.
