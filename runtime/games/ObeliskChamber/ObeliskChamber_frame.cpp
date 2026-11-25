@@ -38,7 +38,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "nxrt/config.h"
 #include "nxrt/dispatch.h"
@@ -485,6 +487,57 @@ void die_cb_try_install() {
     NXLOG_I(kTag, "frame-rate fixes: combat death cries wrapped (anim)%s", g_voice_log ? ", logged ([fefw] diag_voice)" : "");
 }
 
+// ---- talk portraits (Spine): one call per 30 Hz step (issue #205) -----------------------------------------------------------------------
+// The talk portraits are Spine skeletons (spine-cpp). The game's wrapper (0x1947dd0) poses each one at its skeleton data's fps
+// (+0x358) from an accumulator of its own (+0x35c): when it passes one step it applies the animation state, updates the world
+// transform and advances the state by that step; otherwise it still calls spine::AnimationState::update(0.0001), with no apply.
+// At 30 fps every call is a step. At 60 every other call is not, and when the game starts an animation with no mix (the eye blink,
+// talk::Seq::BindFaceEyeBlinkSync: mix duration 0) just before such a call, that update gives the new entry a mix time above 0 and
+// Spine drops the entry it replaces as finished mixing before it was ever applied mixing out. What that entry had set (the open eye's
+// images) is never reset while the blink moves the lids: half-closed lids over open eyes, on several of Fortuna's lines.
+// The manager that calls the wrapper for every skeleton (0x1940d60, only called through a pointer) is wrapped through the function
+// table: between 30 Hz steps it is not called at all, and on a step it is called with the clock frames since the last one
+// ([+0x48] + 0x68, frames of 1/59.94 s; put back after the call), so every skeleton is called once per 30 Hz step, as at 30 fps.
+// Checked on a PC at 60 fps (Fortuna's lines). Group anim: off with the frame-rate fixes, and with [fefw] frame_fixes_skip = anim.
+constexpr uint32_t kSpineManager = 0x1940d60;
+GuestFn g_spine_orig = nullptr;
+std::mutex g_spine_mu;
+std::unordered_map<uint64_t, float> g_spine_acc;   // manager -> clock frames since its last 30 Hz step; under g_spine_mu
+std::atomic<bool> g_spine_tried{false};
+void spine_mgr_wrap(::Ctx* c) {
+    const uint64_t mgr = c->x[0];
+    uint64_t clock = 0;
+    float step = 0.f;
+    if (full(scale(kAnim)) || !vrd(mgr + 0x48, &clock) || !vrd(clock + 0x68, &step) || !(step >= 0.f && step < 64.f)) {
+        g_spine_orig(c);
+        return;
+    }
+    float use = 0.f;
+    {
+        std::lock_guard<std::mutex> lk(g_spine_mu);
+        if (g_spine_acc.size() > 256) g_spine_acc.clear();
+        float& acc = g_spine_acc[mgr];
+        acc += step;
+        if (st().tick.load(std::memory_order_relaxed)) use = acc, acc = 0.f;
+    }
+    count(kAnim);
+    if (use == 0.f) return;   // no 30 Hz step in this frame
+    std::memcpy(reinterpret_cast<void*>(clock + 0x68), &use, 4);
+    g_spine_orig(c);
+    float now = 0.f;
+    if (vrd(clock + 0x68, &now) && now == use) std::memcpy(reinterpret_cast<void*>(clock + 0x68), &step, 4);
+}
+void spine_try_install() {
+    if (g_spine_tried.exchange(true)) return;
+    const uint64_t at = st().base + kSpineManager;
+    if (!(g_spine_orig = fn_lookup(at))) {
+        NXLOG_W(kTag, "frame-rate fixes: the Spine manager (0x%x) is not in this build: talk portraits stay as they are", kSpineManager);
+        return;
+    }
+    fn_register(at, &spine_mgr_wrap);
+    NXLOG_I(kTag, "frame-rate fixes: talk portraits (Spine) called once per 30 Hz step (anim)");
+}
+
 }  // namespace
 
 void frame_install(uint64_t base) {
@@ -527,6 +580,7 @@ void frame_step(float step, int target) {
     State& s = st();
     if (!s.installed || target <= 0) return;
     die_cb_try_install();
+    spine_try_install();
     int native = s.native.load(std::memory_order_relaxed);
     if (native <= 0) native = target;
     const float sc = std::clamp(static_cast<float>(native) / static_cast<float>(target), 0.125f, 1.0f);
