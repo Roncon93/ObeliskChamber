@@ -907,8 +907,34 @@ void diag_ctx() {
     NXLOG_I(kTag, "ctx: %s (slot %s)", now.c_str(), slot.c_str());
 }
 
+// [fefw] diag_help (issue #187, a test switch, on while #187 is tested): logs the details box's state (FloatingHelp, [main+0x2231f30])
+// each time it changes: what its X handler (0x18e4820) and open check (0x18e44c0) read. +0x98 the help process, +0xa8/+0xb0 its
+// list of help sources (16-byte entries), +0xe0 a weak pointer it reads first, +0xfc the block counter (0 lets it open).
+void diag_help() {
+    static const bool on = config_get_bool("fefw", "diag_help", true);
+    static uint64_t last[7] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+    if (!on || !g_base) return;
+    uint64_t fh = 0, proc = 0, b = 0, e = 0, weak = 0, weak_word = 0;
+    int32_t count = 0;
+    rd(g_base + 0x2231f30, &fh);
+    if (fh) {
+        rd(fh + 0x98, &proc);
+        rd(fh + 0xa8, &b);
+        rd(fh + 0xb0, &e);
+        rd(fh + 0xe0, &weak);
+        rd(fh + 0xfc, &count);
+        if (weak) rd(weak + 8, &weak_word);
+    }
+    const uint64_t now[7] = {fh, proc, b, e, weak, weak_word, static_cast<uint32_t>(count)};
+    if (std::equal(std::begin(now), std::end(now), std::begin(last))) return;
+    std::copy(std::begin(now), std::end(now), std::begin(last));
+    NXLOG_I(kTag, "help: details box %llx, help process %llx, sources %lld (at %llx), weak %llx (+8: %llx), block %d",
+            static_cast<unsigned long long>(fh), static_cast<unsigned long long>(proc), e >= b ? static_cast<long long>((e - b) / 16) : -1ll,
+            static_cast<unsigned long long>(b), static_cast<unsigned long long>(weak), static_cast<unsigned long long>(weak_word), count);
+}
 void saveslot_frame() {
     diag_ctx();
+    diag_help();
     if (g_hooked) title_load_tick();
     if (g_hooked && g_tc_ok) title_continue_frame();
     if (g_hooked || g_failed || !g_on || !g_base) return;

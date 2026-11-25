@@ -965,10 +965,15 @@ void menu_close(::Ctx* c) {
     const uint64_t menu = c->x[0];
     std::erase_if(g_help_holds, [menu](const HelpHold& h) { return h.menu == menu; });
     pass(c, g_menu_close_orig);
+    uint64_t fh = 0;
+    int32_t count = -99;
+    if (rd(g_base + kUiCount, &fh) && fh) rd(fh + 0xfc, &count);
+    NXLOG_I(kTag, "menu %llx closed: details box block now %d", static_cast<unsigned long long>(menu), count);
 }
 // slot 12: the menu is being ended; give back a count its close never did
 void menu_end(::Ctx* c) {
     const uint64_t menu = c->x[0];
+    NXLOG_I(kTag, "menu %llx ended (%zu still holding a block)", static_cast<unsigned long long>(menu), g_help_holds.size());
     for (auto it = g_help_holds.begin(); it != g_help_holds.end(); ++it) {
         if (it->menu != menu) continue;
         uint64_t fh = 0;
@@ -1006,6 +1011,8 @@ void menu_init(::Ctx* c) {
     int32_t count = 0;
     if (rd(g_base + kUiCount, &counter) && counter && rd(counter + 0xfc, &count)) {
         wr<int32_t>(counter + 0xfc, std::max(count, -1) + 1);
+        NXLOG_I(kTag, "menu %llx (%s) opened: details box block %d -> %d", static_cast<unsigned long long>(menu), is_list_menu(menu) ? "list" : "options",
+                count, std::max(count, -1) + 1);
         if (help_fix_on()) help_hold(menu);
     }
 }
