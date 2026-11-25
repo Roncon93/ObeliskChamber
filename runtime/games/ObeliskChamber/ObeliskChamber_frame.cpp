@@ -406,19 +406,22 @@ uint32_t parse_skip(const std::string& list) {
     return m;
 }
 
-// ---- [fefw] diag_voice (issue #205, a test switch, on while #205 is tested) -------------------------------------------------------------
-// Combat death cries. game::combat::ActionDamageCore::DoDie (0x1084840) starts a disposable::EveryFrameProc (0x10c8cc0) of 1.0 s with a
-// callback (a std::function; its operator() 0x1085350: x0 = the closure, +8 the unit index; x1 -> t, the proc's elapsed / 1.0 s). Each
-// frame the proc (0x10c9690) adds its clock's step and calls the callback; it ends when the callback returns 0 or t reaches 1. The
-// callback waits for t > 0.04 and for the dying unit's own clock (unit [+88] + 304, its step at + 16) to move, then asks for the voice
-// "Damage_D" or "Damage_H" (0x10b0500 on the unit + 872) and returns 0. 0x10b0500 plays nothing while the unit's voice is still busy
-// (0x100100 on its handle) or voices are off (+113 bit 7 of the combat object). The callback is only ever called through its
-// std::function, so it is wrapped through the function table (no hook site needed) and logs each call: the unit, t, the unit's clock
-// step, and on the frame it would ask for the voice whether 0x10b0500 is going to refuse it. Read only: the game's callback runs as is.
+// ---- combat death cries (anim group; issue #205) ----------------------------------------------------------------------------------------
+// game::combat::ActionDamageCore::DoDie (0x1084840) starts a disposable::EveryFrameProc (0x10c8cc0) of 1.0 s with a callback (a
+// std::function; its operator() 0x1085350: x0 = the closure, +8 the unit index; x1 -> t, the proc's elapsed / 1.0 s). Each frame the proc
+// (0x10c9690) adds its clock's step and calls the callback; it ends when the callback returns 0 or t reaches 1. The callback waits for
+// t > 0.04 and for the dying unit's own clock (unit [+88] + 304, its step this frame at + 16, frames of 1/59.94 s) to have moved more than
+// 0.0001 s this frame, then asks for the voice "Damage_D" or "Damage_H" (0x10b0500 on the unit + 872) and returns 0.
+// At a death the unit's clock stands still (the slow death camera) and then eases back. At 30 fps it passes 0.0001 s a frame at about
+// t = 0.97, two frames before the proc ends (seen on a PC with [fefw] diag_voice: step 0, then 0.001, 0.002, 0.004, 0.006 -> the cry).
+// The threshold is per frame, so at 60 fps the same clock speed moves half as far a frame and passes it only after the proc has ended:
+// no cry (at 120 a quarter). The callback is only ever called through its std::function, so it is wrapped through the function table
+// (no hook site needed): the step it reads is divided by s for the call (the 30 fps step for the same clock speed) and put back after.
+// [fefw] diag_voice logs each death's first wait and how it ended.
 constexpr uint32_t kDieCb = 0x1085350, kVoiceBusy = 0x100100, kUnitTableGot = 0x216b488;
 GuestFn g_die_cb_orig = nullptr;
-std::atomic<int> g_voice_lines{0};
-std::atomic<bool> g_voice_tried{false};
+bool g_voice_log = false;
+std::atomic<bool> g_die_cb_tried{false};
 template <class T> bool vrd(uint64_t a, T* out) {
     if (!a || !mem::is_mapped(a, sizeof(T))) return false;
     std::memcpy(out, reinterpret_cast<const void*>(a), sizeof(T));
@@ -433,45 +436,53 @@ uint64_t vcall(::Ctx* c, uint64_t fn, uint64_t x0) {
     return r;
 }
 void die_cb_wrap(::Ctx* c) {
-    const uint64_t base = st().base;
-    const bool log = g_voice_lines.fetch_add(1, std::memory_order_relaxed) < 800;
+    const uint64_t base = st().base, closure = c->x[0];
     float t = -1.f, step = -1.f;
     uint32_t unit = 0xffffffffu;
-    uint64_t got = 0, table = 0, unit_obj = 0, inner = 0, clock = 0, combat = 0, comp = 0, vh = 0;
-    uint8_t mode = 0;
+    uint64_t got = 0, table = 0, unit_obj = 0, inner = 0, clock = 0;
     vrd(c->x[1], &t);
-    vrd(c->x[0] + 8, &unit);
-    if (vrd(base + kUnitTableGot, &got) && vrd(got, &table) && table && unit <= 3 && vrd(table + unit * 0x18 + 40, &unit_obj) &&
-        vrd(unit_obj + 88, &inner) && vrd(inner + 304, &clock))
-        vrd(clock + 16, &step);
-    const bool asks = t > 0.04f && step * 16.683f * 0.001f > 1e-4f;
+    vrd(closure + 8, &unit);
+    const bool have = vrd(base + kUnitTableGot, &got) && vrd(got, &table) && table && unit <= 3 && vrd(table + unit * 0x18 + 40, &unit_obj) &&
+                      vrd(unit_obj + 88, &inner) && vrd(inner + 304, &clock) && vrd(clock + 16, &step);
+    const float sc = scale(kAnim);
+    const bool scaled = have && sc < 1.0f && step > 0.0f;
+    const float seen = scaled ? step / sc : step;
+    if (scaled) std::memcpy(reinterpret_cast<void*>(clock + 16), &seen, sizeof(float));
     std::string why;
-    if (log && asks) {
+    if (g_voice_log && t > 0.04f && seen * 16.683f * 0.001f > 1e-4f) {     // the frame the callback asks for the voice: will 0x10b0500 play it?
         int busy = -1;
-        if (table && vrd(table + 8, &combat) && combat) vrd(combat + 113, &mode);
-        uint64_t v = 0;
-        if (unit_obj && vrd(unit_obj + 872 + 8, &comp) && vrd(comp + 88, &v) && v && vrd(v + 136, &vh) && vh)
+        uint8_t mode = 0;
+        uint64_t combat = 0, comp = 0, v = 0, vh = 0;
+        if (vrd(table + 8, &combat) && combat) vrd(combat + 113, &mode);
+        if (vrd(unit_obj + 872 + 8, &comp) && vrd(comp + 88, &v) && v && vrd(v + 136, &vh) && vh)
             busy = static_cast<int>(vcall(c, base + kVoiceBusy, vh + 104) & 1);
         why = (mode >> 7 & 1) ? ", voices off: not played" : busy == 1 ? ", the unit's voice is busy: not played" : busy == 0 ? ", played" : ", voice handle not found";
     }
     g_die_cb_orig(c);
-    if (log)
-        NXLOG_I(kTag, "voice: death cry wait, unit %u, t %.3f, unit clock step %.3f -> %s%s", unit, t, step,
-                static_cast<uint32_t>(c->x[0]) & 1 ? (t <= 0.04f ? "waits (t too small)" : "waits (unit clock not moving)") : "asks for the voice",
-                why.c_str());
+    if (scaled) {
+        std::memcpy(reinterpret_cast<void*>(clock + 16), &step, sizeof(float));
+        count(kAnim);
+    }
+    if (!g_voice_log) return;
+    static uint64_t last_closure = 0;   // main thread
+    const bool waits = static_cast<uint32_t>(c->x[0]) & 1, first = closure != last_closure;
+    last_closure = closure;
+    const char* end = !waits ? "asks for the voice" : t >= 0.999f ? "the wait ran out: no cry" : first ? "waits" : nullptr;
+    if (!end) return;
+    NXLOG_I(kTag, "voice: death cry, unit %u, t %.3f, unit clock step %.4f (the callback sees %.4f) -> %s%s", unit, t, step, seen, end, why.c_str());
 }
 // The lifted modules are registered after play mode installs its hooks: wrap the callback at the first frame step.
-void voice_diag_try_install() {
-    if (g_voice_tried.exchange(true)) return;
-    if (!config_get_bool("fefw", "diag_voice", true)) return;
+void die_cb_try_install() {
+    if (g_die_cb_tried.exchange(true)) return;
+    g_voice_log = config_get_bool("fefw", "diag_voice", true);
     const uint64_t at = st().base + kDieCb;
     g_die_cb_orig = fn_lookup(at);
     if (!g_die_cb_orig || !fn_lookup(st().base + kVoiceBusy)) {
-        NXLOG_W(kTag, "voice: [fefw] diag_voice: the death cry callback (0x%x) is not in this build", kDieCb);
+        NXLOG_W(kTag, "frame-rate fixes: the combat death cry callback (0x%x) is not in this build: death cries stay as they are", kDieCb);
         return;
     }
     fn_register(at, &die_cb_wrap);
-    NXLOG_I(kTag, "voice: death cry logging on ([fefw] diag_voice, issue #205)");
+    NXLOG_I(kTag, "frame-rate fixes: combat death cries wrapped (anim)%s", g_voice_log ? ", logged ([fefw] diag_voice)" : "");
 }
 
 }  // namespace
@@ -515,7 +526,7 @@ void frame_install(uint64_t base) {
 void frame_step(float step, int target) {
     State& s = st();
     if (!s.installed || target <= 0) return;
-    voice_diag_try_install();
+    die_cb_try_install();
     int native = s.native.load(std::memory_order_relaxed);
     if (native <= 0) native = target;
     const float sc = std::clamp(static_cast<float>(native) / static_cast<float>(target), 0.125f, 1.0f);
