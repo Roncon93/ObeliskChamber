@@ -615,10 +615,10 @@ constexpr uint64_t kGameMgr = 0x2231908;
 constexpr uint64_t kGameCtx = 8, kGameCtxFlag = 0x10, kCtxSize = 0x170, kCtxLive = 0x11c;
 constexpr int kCtxCount = 10;
 void end_game_context() {
-    static const bool on = config_get_bool("fefw", "load_ends_game", true);
+    static const bool on = config_get_bool("fefw", "load_ends_game", false);
     uint64_t g = 0;
     // (0x188dc80 and 0x188d790, Return to Title's Yes entries, are where this was read from: on another build the offsets are not trusted)
-    if (!on || !fn_lookup(g_base + 0x188dc80) || !fn_lookup(g_base + 0x188d790) || !rd(g_base + kGameMgr, &g) || !g) return;
+    if (!fn_lookup(g_base + 0x188dc80) || !fn_lookup(g_base + 0x188d790) || !rd(g_base + kGameMgr, &g) || !g) return;
     uint32_t live[kCtxCount] = {}, pending = 0;
     uint8_t flag = 0;
     std::string list;
@@ -629,6 +629,7 @@ void end_game_context() {
     rd(g + kGameCtx, &pending);
     rd(g + kGameCtxFlag, &flag);
     NXLOG_I(kTag, "Load: game contexts live:%s; G+8 = %u, G+0x10 = %u", list.empty() ? " none" : list.c_str(), pending, flag);
+    if (!on) return;      // off for now (ending context 6 in a hub did not help): the line above is kept for #187
     for (int i : {4, 6, 1}) {
         if (!live[i]) continue;
         wr<uint8_t>(g + kGameCtxFlag, 0);
@@ -805,7 +806,43 @@ void saveslot_install(uint64_t base) {
 }
 
 // Main thread, once per frame: hooks the entries once the game's data is there and is the build the addresses are for.
+// [fefw] diag_ctx (issue #187, a test switch, default on for now): each time the set of live game-manager contexts (G + i*0x170 + 0x11c,
+// i < 16), the context asked to end (G+8, G+0x10) or the main sequence's request (+0x98) changes, one line says so (at most 200 a run).
+// Compared between a session that loads from the title and one that loads from the + menu.
+void diag_ctx() {
+    static const bool on = config_get_bool("fefw", "diag_ctx", true);
+    static int lines = 0;
+    static std::string last;
+    if (!on || lines >= 200 || !g_base) return;
+    uint64_t g = 0, seq = 0;
+    uint32_t state = 0xffffffffu, pending = 0;
+    uint8_t flag = 0;
+    if (rd(g_base + kMainSeq, &seq) && seq) rd(seq + 0x98, &state);
+    std::string now = "seq " + std::to_string(state);
+    if (rd(g_base + kGameMgr, &g) && g) {
+        rd(g + kGameCtx, &pending);
+        rd(g + kGameCtxFlag, &flag);
+        now += ", G+8 " + std::to_string(pending) + " G+0x10 " + std::to_string(flag) + ", live:";
+        for (int i = 0; i < 16; ++i) {
+            uint32_t live = 0;
+            if (rd(g + i * kCtxSize + kCtxLive, &live) && live) now += " " + std::to_string(i);
+        }
+    } else {
+        now += ", no game manager";
+    }
+    if (now == last) return;
+    last = now;
+    ++lines;
+    std::string slot;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        slot = g_active;
+    }
+    NXLOG_I(kTag, "ctx: %s (slot %s)", now.c_str(), slot.c_str());
+}
+
 void saveslot_frame() {
+    diag_ctx();
     if (g_hooked && g_tc_ok) title_continue_frame();
     if (g_hooked || g_failed || !g_on || !g_base) return;
     uint64_t probe = 0;
