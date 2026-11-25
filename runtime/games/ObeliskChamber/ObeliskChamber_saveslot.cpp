@@ -722,6 +722,7 @@ uint32_t load_direct(::Ctx* c, int i, const std::string& slot) {
         g_before_new.clear();
         set_active(slot);
     }
+    optmenu_release_help();
     if (load_via_title(c, slot)) {
         optmenu_close_list(c);
         return kPickNothing;
@@ -777,6 +778,7 @@ void prompt_yes(::Ctx* c) {
     // On the world map the load the game just asked for waited until the slot list was closed by hand (seen on a PC): close it here.
     if (from_list) {
         const uint64_t answer = c->x[0];
+        optmenu_release_help();
         optmenu_close_list(c);
         c->x[0] = answer;
     }

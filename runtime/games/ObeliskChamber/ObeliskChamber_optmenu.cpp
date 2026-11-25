@@ -943,51 +943,43 @@ void tab_label(::Ctx* c) {
 
 // [fefw] help_unblock (default on; issue #187). The X details box (FloatingHelp, [main+0x2231f30]) opens only while the counter at
 // +0xfc is 0 (0x18e44c0). The game's menu OnInit (slot 84, 0x16a4620, copied by menu_init) adds 1 and its close (slot 94, 0x16a4790)
-// takes it back. That close runs only from the menu's step function (0x1712040) before the menu ends itself. A menu ended by its
-// parent instead (ProcEnd 0x65a7a0 calls slot 12, which goes to slots 18 and 92) never runs slot 94, and the destructor
-// (0x1711500) does not touch the counter. A Load from the pick list ends the + menu's tree with our menus still open, so the counter
-// stays above 0 and X is blocked until the game is closed. We remember which of our menus hold a count and give it back in slot 12.
+// takes it back. A Load from the pick list ends the game with the list still open, and its close never runs (seen on a PC with
+// [fefw] diag_help: the list took the block 0 -> 1 and no close or end of it was seen before or after the load), so the block stayed 1
+// and X did nothing until the game was closed. We remember the count each of our menus holds and give it back when a Load from the
+// list goes ahead (optmenu_release_help). If the game does close such a menu after that, its own take-back is undone so it is not
+// taken twice.
 struct HelpHold { uint64_t menu; int32_t n; };
 std::vector<HelpHold> g_help_holds;
-uint64_t g_menu_close_orig = 0, g_menu_end_orig = 0;    // the game's slots 94 and 12
-constexpr int kMSlotEnd = 12, kMSlotClose = 94;
+std::vector<uint64_t> g_help_released;   // menus whose count we gave back ourselves
+uint64_t g_menu_close_orig = 0;          // the game's slot 94
+constexpr int kMSlotClose = 94;
 bool help_fix_on() {
     static const bool on = config_get_bool("fefw", "help_unblock", true);
-    return on && g_menu_close_orig && g_menu_end_orig;
+    return on && g_menu_close_orig;
 }
 void help_hold(uint64_t menu) {
+    std::erase(g_help_released, menu);   // a new menu at the address of an old one
     for (auto& h : g_help_holds)
         if (h.menu == menu) { ++h.n; return; }
     g_help_holds.push_back({menu, 1});
+}
+int32_t help_block() {
+    uint64_t fh = 0;
+    int32_t count = 0;
+    return rd(g_base + kUiCount, &fh) && fh && rd(fh + 0xfc, &count) ? count : -99;
 }
 // slot 94: the game's close gives the count back itself
 void menu_close(::Ctx* c) {
     const uint64_t menu = c->x[0];
     std::erase_if(g_help_holds, [menu](const HelpHold& h) { return h.menu == menu; });
+    const bool released = std::erase(g_help_released, menu) > 0;
+    const int32_t before = help_block();
     pass(c, g_menu_close_orig);
+    const int32_t after = help_block();
     uint64_t fh = 0;
-    int32_t count = -99;
-    if (rd(g_base + kUiCount, &fh) && fh) rd(fh + 0xfc, &count);
-    NXLOG_I(kTag, "menu %llx closed: details box block now %d", static_cast<unsigned long long>(menu), count);
-}
-// slot 12: the menu is being ended; give back a count its close never did
-void menu_end(::Ctx* c) {
-    const uint64_t menu = c->x[0];
-    NXLOG_I(kTag, "menu %llx ended (%zu still holding a block)", static_cast<unsigned long long>(menu), g_help_holds.size());
-    for (auto it = g_help_holds.begin(); it != g_help_holds.end(); ++it) {
-        if (it->menu != menu) continue;
-        uint64_t fh = 0;
-        int32_t count = 0;
-        if (rd(g_base + kUiCount, &fh) && fh && rd(fh + 0xfc, &count)) {
-            const int32_t now = std::max(count - it->n, 0);
-            wr<int32_t>(fh + 0xfc, now);
-            NXLOG_I(kTag, "menu %llx ended without its close: details box block %d -> %d ([fefw] help_unblock)",
-                    static_cast<unsigned long long>(menu), count, now);
-        }
-        g_help_holds.erase(it);
-        break;
-    }
-    pass(c, g_menu_end_orig);
+    if (released && after < before && rd(g_base + kUiCount, &fh) && fh) wr<int32_t>(fh + 0xfc, before);
+    NXLOG_I(kTag, "menu %llx closed: details box block %d -> %d%s", static_cast<unsigned long long>(menu), before,
+            released ? before : after, released ? " (already given back at the Load)" : "");
 }
 
 // slot 84, the game's OnInit with our label function (its own reads a table of three message ids)
@@ -1371,11 +1363,8 @@ void optmenu_frame() {
     }
     g_mvt[2 + kMSlotOnInit] = hle_register("fefw.optmenu.init", menu_init);
     g_menu_close_orig = g_mvt[2 + kMSlotClose];
-    g_menu_end_orig = g_mvt[2 + kMSlotEnd];
-    if (fn_lookup(g_menu_close_orig) && fn_lookup(g_menu_end_orig)) {
-        g_mvt[2 + kMSlotClose] = hle_register("fefw.optmenu.close", menu_close);
-        g_mvt[2 + kMSlotEnd] = hle_register("fefw.optmenu.end", menu_end);
-    } else g_menu_close_orig = g_menu_end_orig = 0;
+    if (fn_lookup(g_menu_close_orig)) g_mvt[2 + kMSlotClose] = hle_register("fefw.optmenu.close", menu_close);
+    else g_menu_close_orig = 0;
     g_mvt[2 + kMSlotHelp] = hle_register("fefw.optmenu.help", menu_help);
     g_mvt[2 + kMSlotMinus] = hle_register("fefw.optmenu.minus", menu_minus);
     g_mvt[2 + kMSlotKeyHelp] = hle_register("fefw.optmenu.keyhelp", menu_keyhelp);
@@ -1386,7 +1375,7 @@ void optmenu_frame() {
     g_update_orig = g_ivt[2 + kISlotUpdate];
     g_ivt[2 + kISlotUpdate] = hle_register("fefw.optmenu.item_update", item_update);
     g_fvt[2 + kFSlotInvoke] = hle_register("fefw.optmenu.tab_label", tab_label);
-    for (int slot : {kMSlotOnInit, kMSlotHelp, kMSlotMinus, kMSlotKeyHelp, kMSlotClose, kMSlotEnd}) g_mvt2[2 + slot] = g_mvt[2 + slot];
+    for (int slot : {kMSlotOnInit, kMSlotHelp, kMSlotMinus, kMSlotKeyHelp, kMSlotClose}) g_mvt2[2 + slot] = g_mvt[2 + slot];
     g_ivt2[2 + kISlotText] = hle_register("fefw.optmenu.list_text", list_text);
     g_ivt2[2 + kISlotACall] = hle_register("fefw.optmenu.list_acall", list_acall);
     g_ivt2[2 + kISlotValue] = hle_register("fefw.optmenu.list_value", list_value);
@@ -1523,6 +1512,22 @@ int mod_open_list(::Ctx* c, uint64_t item, const ::NxModList* list) {
 }  // namespace
 // The pick list closes as B on a row closes it (the menu's handler with the answer 3), when it is open. For a pick whose prompt decided
 // something the list must not stay over.
+// A Load from the pick list is going ahead: the game ends with our menus open, so give back the details box block they hold.
+void optmenu_release_help() {
+    if (!help_fix_on() || g_help_holds.empty()) return;
+    int32_t n = 0;
+    for (const auto& h : g_help_holds) {
+        n += h.n;
+        g_help_released.push_back(h.menu);
+    }
+    g_help_holds.clear();
+    uint64_t fh = 0;
+    const int32_t count = help_block();
+    if (count == -99 || !rd(g_base + kUiCount, &fh) || !fh) return;
+    const int32_t now = std::max(count - n, 0);
+    wr<int32_t>(fh + 0xfc, now);
+    NXLOG_I(kTag, "Load: details box block %d -> %d, given back for our open menus ([fefw] help_unblock)", count, now);
+}
 void optmenu_close_list(::Ctx* c) {
     uint64_t vt = 0;
     const uint64_t menu = g_list_menu;
