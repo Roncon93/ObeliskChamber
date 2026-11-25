@@ -603,27 +603,40 @@ uint64_t save_root() {
     return rd(item_menu + 0x98, &root) && root ? root : item_menu;
 }
 // [fefw] load_ends_game (default on; issue #187): a load from the + menu first ends the running game's context the way the + menu's Return
-// to Title does. The game manager ([main+0x2231908], G) keeps contexts of 0x170 bytes from G+0x10c; Return to Title's Yes (0x188dc80),
-// when context 4 is live (G+0x6dc, its +0x11c), sets G+0x10 = 0 and G+8 = 4 before asking for the title (main sequence 14), and the
-// game's end (0x665dd0) then winds up context G+8 (0x8b3d20). The Continue prompt's Yes (0x16dd880) is written for the title, where no
-// context is live: it asks for the load (main sequence 32) and leaves G+8 at 0, so from the + menu context 4 was never wound up. Its
-// leftovers lasted until the game was closed (after it, X no longer opened the details box in Information and Roster, even after Return
-// to Title and Continue; seen on a PC).
+// to Title does. The game manager ([main+0x2231908], G) keeps contexts of 0x170 bytes, context i's live word at G + i*0x170 + 0x11c
+// (0x8b3860 starts one, 0x8b3d20 winds one up). The + menu's Return to Title Yes entries each end one context when it is live: 0x188dc80
+// context 4; 0x188d790 context 6 or 1 (by its entry's +0x90). They set G+0x10 = 0 and G+8 = the context before asking for the title
+// (main sequence 14), and the game's end (0x665dd0) then winds up context G+8. The Continue prompt's Yes (0x16dd880) is written for the
+// title, where none is live: it asks for the load (main sequence 32) and leaves G+8 at 0, so from the + menu the context was never wound
+// up. Its leftovers lasted until the game was closed (after it, X no longer opened the details box in Information and Roster, even
+// after Return to Title and Continue; seen on a PC). The first fix looked at context 4 only, which was not live in a hub (the details box
+// still failed): the live contexts are logged, and the first live one of 4, 6 and 1 is ended.
 constexpr uint64_t kGameMgr = 0x2231908;
-constexpr uint64_t kGameCtx = 8, kGameCtxFlag = 0x10, kGameCtx4Live = 0x6dc;
+constexpr uint64_t kGameCtx = 8, kGameCtxFlag = 0x10, kCtxSize = 0x170, kCtxLive = 0x11c;
+constexpr int kCtxCount = 10;
 void end_game_context() {
     static const bool on = config_get_bool("fefw", "load_ends_game", true);
     uint64_t g = 0;
-    uint32_t live = 0;
-    // (0x188dc80, Return to Title's Yes, is where this was read from: on another build the offsets are not trusted)
-    if (!on || !fn_lookup(g_base + 0x188dc80) || !rd(g_base + kGameMgr, &g) || !g || !rd(g + kGameCtx4Live, &live)) return;
-    if (!live) {
-        NXLOG_I(kTag, "Load: no game context to end (context 4 is not live)");
+    // (0x188dc80 and 0x188d790, Return to Title's Yes entries, are where this was read from: on another build the offsets are not trusted)
+    if (!on || !fn_lookup(g_base + 0x188dc80) || !fn_lookup(g_base + 0x188d790) || !rd(g_base + kGameMgr, &g) || !g) return;
+    uint32_t live[kCtxCount] = {}, pending = 0;
+    uint8_t flag = 0;
+    std::string list;
+    for (int i = 0; i < kCtxCount; ++i) {
+        if (!rd(g + i * kCtxSize + kCtxLive, &live[i])) live[i] = 0;
+        if (live[i]) list += " " + std::to_string(i) + "(" + std::to_string(live[i]) + ")";
+    }
+    rd(g + kGameCtx, &pending);
+    rd(g + kGameCtxFlag, &flag);
+    NXLOG_I(kTag, "Load: game contexts live:%s; G+8 = %u, G+0x10 = %u", list.empty() ? " none" : list.c_str(), pending, flag);
+    for (int i : {4, 6, 1}) {
+        if (!live[i]) continue;
+        wr<uint8_t>(g + kGameCtxFlag, 0);
+        wr<uint32_t>(g + kGameCtx, static_cast<uint32_t>(i));
+        NXLOG_I(kTag, "Load: the running game's context %d is ended first, as Return to Title does ([fefw] load_ends_game)", i);
         return;
     }
-    wr<uint8_t>(g + kGameCtxFlag, 0);
-    wr<uint32_t>(g + kGameCtx, 4);
-    NXLOG_I(kTag, "Load: the running game's context 4 is ended first, as Return to Title does ([fefw] load_ends_game)");
+    NXLOG_I(kTag, "Load: none of the contexts Return to Title ends (4, 6, 1) is live");
 }
 // The slot becomes the one in use and the game is asked to load its Auto file (what the Continue prompt's Yes does).
 void load_now(::Ctx* c, const std::string& slot, uint64_t root, uint64_t seq) {
