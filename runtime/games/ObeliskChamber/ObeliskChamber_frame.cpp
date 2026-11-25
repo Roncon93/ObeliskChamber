@@ -408,63 +408,70 @@ uint32_t parse_skip(const std::string& list) {
 
 // ---- [fefw] diag_voice (issue #205, a test switch, on while #205 is tested) -------------------------------------------------------------
 // Combat death cries. game::combat::ActionDamageCore::DoDie (0x1084840) starts a disposable::EveryFrameProc (0x10c8cc0) of 1.0 s with a
-// callback (std::function, operator() 0x1085350; x0 = the closure, +8 the unit index; x1 -> t, the proc's elapsed / 1.0 s). Each frame the
-// proc adds its clock's step ([+200] + 16, frames of 1/59.94 s) and calls the callback; it ends when the callback returns 0 or t reaches 1.
-// The callback waits for t > 0.04 and for the dying unit's own clock (unit [+88] + 304, its step at + 16) to move, then plays the voice
-// "Damage_D" or "Damage_H" (0x10b0500 on the unit + 872) and returns 0. 0x10b0500 does not play when the unit's voice is still busy
-// (0x100100 on its handle, the branch to 0x10b059c). These inline hooks only read and log, so the next log shows which of these drops
-// the cries at 60 fps.
-constexpr uint32_t kDieCb = 0x1085350, kVoicePlay = 0x10b0500, kVoicePlayed = 0x10b05ac, kVoiceRefused = 0x10b059c;
-constexpr uint32_t kUnitTableGot = 0x216b488;
+// callback (a std::function; its operator() 0x1085350: x0 = the closure, +8 the unit index; x1 -> t, the proc's elapsed / 1.0 s). Each
+// frame the proc (0x10c9690) adds its clock's step and calls the callback; it ends when the callback returns 0 or t reaches 1. The
+// callback waits for t > 0.04 and for the dying unit's own clock (unit [+88] + 304, its step at + 16) to move, then asks for the voice
+// "Damage_D" or "Damage_H" (0x10b0500 on the unit + 872) and returns 0. 0x10b0500 plays nothing while the unit's voice is still busy
+// (0x100100 on its handle) or voices are off (+113 bit 7 of the combat object). The callback is only ever called through its
+// std::function, so it is wrapped through the function table (no hook site needed) and logs each call: the unit, t, the unit's clock
+// step, and on the frame it would ask for the voice whether 0x10b0500 is going to refuse it. Read only: the game's callback runs as is.
+constexpr uint32_t kDieCb = 0x1085350, kVoiceBusy = 0x100100, kUnitTableGot = 0x216b488;
+GuestFn g_die_cb_orig = nullptr;
 std::atomic<int> g_voice_lines{0};
+std::atomic<bool> g_voice_tried{false};
 template <class T> bool vrd(uint64_t a, T* out) {
     if (!a || !mem::is_mapped(a, sizeof(T))) return false;
     std::memcpy(out, reinterpret_cast<const void*>(a), sizeof(T));
     return true;
 }
-std::string vlabel(uint64_t p) {
-    char buf[48] = {};
-    for (size_t i = 0; i + 1 < sizeof buf; ++i) {
-        if (!vrd(p + i, &buf[i]) || !buf[i]) break;
-    }
-    return buf;
+uint64_t vcall(::Ctx* c, uint64_t fn, uint64_t x0) {
+    const ::Ctx saved = *c;
+    c->x[0] = x0;
+    dispatch_call(c, fn);
+    const uint64_t r = c->x[0];
+    *c = saved;
+    return r;
 }
-bool voice_log_room() { return g_voice_lines.fetch_add(1, std::memory_order_relaxed) < 600; }
-void hook_die_cb(::Ctx* c, uint64_t, void*) {
-    if (!voice_log_room()) return;
+void die_cb_wrap(::Ctx* c) {
     const uint64_t base = st().base;
+    const bool log = g_voice_lines.fetch_add(1, std::memory_order_relaxed) < 800;
     float t = -1.f, step = -1.f;
     uint32_t unit = 0xffffffffu;
-    uint64_t table = 0, got = 0, chr = 0, obj = 0, clock = 0;
+    uint64_t got = 0, table = 0, unit_obj = 0, inner = 0, clock = 0, combat = 0, comp = 0, vh = 0;
+    uint8_t mode = 0;
     vrd(c->x[1], &t);
     vrd(c->x[0] + 8, &unit);
-    if (vrd(base + kUnitTableGot, &got) && vrd(got, &table) && table && unit <= 3 && vrd(table + unit * 0x18 + 40, &chr) && vrd(chr + 88, &obj) &&
-        vrd(obj + 304, &clock))
+    if (vrd(base + kUnitTableGot, &got) && vrd(got, &table) && table && unit <= 3 && vrd(table + unit * 0x18 + 40, &unit_obj) &&
+        vrd(unit_obj + 88, &inner) && vrd(inner + 304, &clock))
         vrd(clock + 16, &step);
-    NXLOG_I(kTag, "voice: death cry wait, unit %u, t %.3f, unit clock step %.3f%s", unit, t, step,
-            t <= 0.04f ? " (t too small)" : step * 16.683f * 0.001f <= 1e-4f ? " (unit clock not moving)" : " (plays now)");
+    const bool asks = t > 0.04f && step * 16.683f * 0.001f > 1e-4f;
+    std::string why;
+    if (log && asks) {
+        int busy = -1;
+        if (table && vrd(table + 8, &combat) && combat) vrd(combat + 113, &mode);
+        uint64_t v = 0;
+        if (unit_obj && vrd(unit_obj + 872 + 8, &comp) && vrd(comp + 88, &v) && v && vrd(v + 136, &vh) && vh)
+            busy = static_cast<int>(vcall(c, base + kVoiceBusy, vh + 104) & 1);
+        why = (mode >> 7 & 1) ? ", voices off: not played" : busy == 1 ? ", the unit's voice is busy: not played" : busy == 0 ? ", played" : ", voice handle not found";
+    }
+    g_die_cb_orig(c);
+    if (log)
+        NXLOG_I(kTag, "voice: death cry wait, unit %u, t %.3f, unit clock step %.3f -> %s%s", unit, t, step,
+                static_cast<uint32_t>(c->x[0]) & 1 ? (t <= 0.04f ? "waits (t too small)" : "waits (unit clock not moving)") : "asks for the voice",
+                why.c_str());
 }
-void hook_voice_play(::Ctx* c, uint64_t, void*) {
-    if (!voice_log_room()) return;
-    NXLOG_I(kTag, "voice: play \"%s\" from %llx", vlabel(c->x[1]).c_str(), static_cast<unsigned long long>(c->x[30] - st().base));
-}
-void hook_voice_played(::Ctx* c, uint64_t, void*) {
-    if (!voice_log_room()) return;
-    NXLOG_I(kTag, "voice: played \"%s\"", vlabel(c->x[21]).c_str());
-}
-void hook_voice_refused(::Ctx* c, uint64_t, void*) {
-    if (!voice_log_room()) return;
-    NXLOG_I(kTag, "voice: not played (the unit's voice is busy, or voices are off) \"%s\"", vlabel(c->x[21]).c_str());
-}
-size_t voice_diag_install(uint64_t base) {
-    if (!config_get_bool("fefw", "diag_voice", true)) return 0;
-    size_t n = 0;
-    n += hook_add_inline(base + kDieCb, &hook_die_cb) ? 1 : 0;
-    n += hook_add_inline(base + kVoicePlay, &hook_voice_play) ? 1 : 0;
-    n += hook_add_inline(base + kVoicePlayed, &hook_voice_played) ? 1 : 0;
-    n += hook_add_inline(base + kVoiceRefused, &hook_voice_refused) ? 1 : 0;
-    NXLOG_I(kTag, "voice: death cry and voice logging on ([fefw] diag_voice, issue #205): %zu hooks", n);
-    return n;
+// The lifted modules are registered after play mode installs its hooks: wrap the callback at the first frame step.
+void voice_diag_try_install() {
+    if (g_voice_tried.exchange(true)) return;
+    if (!config_get_bool("fefw", "diag_voice", true)) return;
+    const uint64_t at = st().base + kDieCb;
+    g_die_cb_orig = fn_lookup(at);
+    if (!g_die_cb_orig || !fn_lookup(st().base + kVoiceBusy)) {
+        NXLOG_W(kTag, "voice: [fefw] diag_voice: the death cry callback (0x%x) is not in this build", kDieCb);
+        return;
+    }
+    fn_register(at, &die_cb_wrap);
+    NXLOG_I(kTag, "voice: death cry logging on ([fefw] diag_voice, issue #205)");
 }
 
 }  // namespace
@@ -497,7 +504,6 @@ void frame_install(uint64_t base) {
     // the lifted modules are registered after play mode installs its hooks
     n += hook_add_mid(base + kQuakeStart, &hook_quake) ? 1 : 0;
     n += hook_add_entry(base + kTextStep, &hook_text_step) ? 1 : 0;
-    voice_diag_install(base);
     std::string skipped;
     for (int g = 0; g < kGroups; ++g)
         if (s.skip >> g & 1u) skipped += std::string(skipped.empty() ? "" : ", ") + kGroupNames[g];
@@ -509,6 +515,7 @@ void frame_install(uint64_t base) {
 void frame_step(float step, int target) {
     State& s = st();
     if (!s.installed || target <= 0) return;
+    voice_diag_try_install();
     int native = s.native.load(std::memory_order_relaxed);
     if (native <= 0) native = target;
     const float sc = std::clamp(static_cast<float>(native) / static_cast<float>(target), 0.125f, 1.0f);
