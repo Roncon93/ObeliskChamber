@@ -488,6 +488,7 @@ constexpr uint32_t kFacialUpdate = 0x10d1920;
 GuestFn g_facial_orig = nullptr;
 std::atomic<int> g_facial_lines{0};
 void face_module_note(uint64_t ctl);
+std::atomic<uint64_t> g_hold_count{0};   // clip times held (face_anim_hold)
 int g_hold_mode = 0;   // [fefw] face_anim_hold: 0 off, 1 face, 2 all (below)
 bool g_facial_log = false;
 void facial_wrap(::Ctx* c) {
@@ -521,9 +522,41 @@ void facial_wrap(::Ctx* c) {
         else std::snprintf(b, sizeof b, " %x:#%08x", off, std::bit_cast<uint32_t>(f));
         vals += b;
     }
+    // The face's anim layers ([controller + 0x88] = wld::AnimLayerCtrlModule: layers of 0x48 bytes at +0x20, each with entries of
+    // 0x38 bytes at +0x18: weight +0x18, its speed +0x1c, fading out +0x28, done +0x29, node +0x10) and each entry's clip node in the
+    // wld::AnimCtrlModule ([layers + 0x18], nodes of 0x68 at +0x48: speed +8, time [+0x10] + 0, weight +0x60, on +0x21).
+    std::string lay;
+    uint64_t lc = 0, mod = 0, lb = 0, le = 0, nb = 0, ne = 0;
+    int32_t enable = 0;
+    vrd(ctl + 0x60, &enable);
+    if (vrd(ctl + 0x88, &lc) && vrd(lc + 0x18, &mod) && vrd(lc + 0x20, &lb) && vrd(lc + 0x28, &le) && le >= lb && (le - lb) / 0x48 <= 16) {
+        vrd(mod + 0x48, &nb), vrd(mod + 0x50, &ne);
+        for (uint64_t L = lb, li = 0; L + 0x48 <= le; L += 0x48, ++li) {
+            uint64_t eb = 0, ee = 0;
+            if (!vrd(L + 0x18, &eb) || !vrd(L + 0x20, &ee) || ee < eb || (ee - eb) / 0x38 > 16) continue;
+            for (uint64_t E = eb; E + 0x38 <= ee; E += 0x38) {
+                float w = 0.f, sp = 0.f, nt = -1.f, ns = 0.f, nw = 0.f;
+                uint8_t fo = 0, dn = 0, on = 0;
+                int32_t idx = -1;
+                vrd(E + 0x18, &w), vrd(E + 0x1c, &sp), vrd(E + 0x28, &fo), vrd(E + 0x29, &dn), vrd(E + 0x10, &idx);
+                if (idx >= 0 && nb && nb + (static_cast<uint64_t>(idx) + 1) * 0x68 <= ne) {
+                    const uint64_t node = nb + static_cast<uint64_t>(idx) * 0x68;
+                    uint64_t ts = 0;
+                    vrd(node + 8, &ns), vrd(node + 0x60, &nw), vrd(node + 0x21, &on);
+                    if (vrd(node + 0x10, &ts)) vrd(ts, &nt);
+                }
+                char b[96];
+                std::snprintf(b, sizeof b, " L%llu[w%.3f v%.2f%s%s n%d t%.2f x%.2f nw%.2f%s]", static_cast<unsigned long long>(li), w, sp,
+                              fo ? " out" : "", dn ? " done" : "", idx, nt, ns, nw, on ? " on" : "");
+                lay += b;
+            }
+        }
+    }
     g_facial_lines.fetch_add(1, std::memory_order_relaxed);
-    NXLOG_I(kTag, "facial: ctl %llx owner %llx step %.3f |%s", static_cast<unsigned long long>(ctl), static_cast<unsigned long long>(owner), step,
-            vals.c_str());
+    NXLOG_I(kTag, "facial: ctl %llx owner %llx step %.3f enable %08x held %llu |%s", static_cast<unsigned long long>(ctl),
+            static_cast<unsigned long long>(owner), step, static_cast<uint32_t>(enable),
+            static_cast<unsigned long long>(g_hold_count.load(std::memory_order_relaxed)), vals.c_str());
+    if (!lay.empty()) NXLOG_I(kTag, "facial: ctl %llx layers:%s", static_cast<unsigned long long>(ctl), lay.c_str());
 }
 // ---- [fefw] face_anim_hold (issue #205, a test switch) ----------------------------------------------------------------------------------
 // The blink (0x10d2b80, from the controller's update) plays two clips together on anim layers 2 and 3 of the face's
@@ -540,7 +573,6 @@ struct Held { uint64_t ts; float real, shown, last_tick; };
 std::mutex g_hold_mu;
 std::unordered_set<uint64_t> g_face_modules;                     // under g_hold_mu
 std::unordered_map<uint64_t, std::vector<Held>> g_held;          // module -> its clips' times; under g_hold_mu
-std::atomic<uint64_t> g_hold_count{0};
 void face_module_note(uint64_t ctl) {
     uint64_t layers = 0, module = 0, vt = 0;
     if (!vrd(ctl + 0x88, &layers) || !vrd(layers + 0x18, &module) || !vrd(module, &vt) || vt != st().base + kAnimCtrlVtable) return;
