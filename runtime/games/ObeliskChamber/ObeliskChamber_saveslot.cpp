@@ -613,8 +613,7 @@ uint64_t save_root() {
 // Continue from the title starts them again (seen on a PC with [fefw] diag_ctx). So Yes on the Load prompt makes the slot the one in
 // use, closes the prompt's save report as the game's Yes does (0x1618dc0 on [main+0x22a10c0]), and runs that Return to Title Yes with
 // the + menu's Save entry where it reads its entry (its x1 points at it). The next time the title menu draws a selectable Continue
-// (within two minutes) the slot is loaded as the title's Continue Yes loads it (load_now: pending load 2, -1; the title menu ends;
-// request 32), with no second prompt. `false`: the load from inside the game, as before.
+// (within two minutes) the slot is loaded by the title Continue prompt's own Yes, with no second prompt (title_load_frame). `false`: the load from inside the game, as before.
 constexpr uint64_t kReturnToTitleYes = 0x188e120, kReportWindow = 0x22a10c0, kReportClose = 0x1618dc0;
 constexpr auto kTitleLoadWait = std::chrono::minutes(2);
 Clock::time_point g_title_load_at;
@@ -646,28 +645,50 @@ bool load_via_title(::Ctx* c, const std::string& slot) {
     return true;
 }
 void load_now(::Ctx* c, const std::string& slot, uint64_t root, uint64_t seq);
-// Saveslot_frame, the first frame a title menu draws a selectable Continue: the slot waiting for the title is loaded.
+// Saveslot_frame, the first frame a title menu draws a selectable Continue: the load is armed, and kTitleLoadFrames frames later
+// (title_load_tick) the slot is loaded by the title Continue prompt's own Yes (0x16dd880: fade, the save report closes, pending load
+// 2, -1, the menu's root ends, request 32), given an object whose +8 is the title menu's root as the prompt's own is. A first version
+// loaded at once with the pieces of that Yes (load_now) and X still failed afterwards, while Return to Title and a Continue by hand
+// worked.
+constexpr int kTitleLoadFrames = 60;
+uint64_t g_tl_menu = 0, g_tl_item = 0;
+int g_tl_wait = 0;
 bool title_load_frame(uint64_t menu, uint64_t item) {
     if (!title_load_waiting()) return false;
-    uint64_t root = 0, seq = 0;
     uint8_t selectable = 0;
     if (kind_of(item) != kContinue || !rd(item + 0x51, &selectable) || !selectable) return false;
-    if (!rd(menu + 0x98, &root) || !root) root = menu;           // the title's Continue: the menu's root, else the menu (0x16d4ae0)
-    if (!rd(g_base + kMainSeq, &seq) || !seq || !mem::is_mapped(seq + 0x98, 4)) return false;
-    ::Ctx* c = kernel::current_ctx();
-    if (!c) return false;
+    g_tl_menu = menu;
+    g_tl_item = item;
+    g_tl_wait = kTitleLoadFrames;
+    return true;
+}
+void title_load_tick() {
+    if (g_tl_wait <= 0 || --g_tl_wait > 0) return;
+    const uint64_t menu = g_tl_menu, item = g_tl_item;
+    g_tl_menu = g_tl_item = 0;
     const std::string slot = g_title_load;
     g_title_load.clear();
+    uint64_t root = 0, cur = 0;
+    if (slot.empty() || kind_of(item) != kContinue || !rd(menu + kMenuCurrent, &cur)) {
+        NXLOG_W(kTag, "Load: the title menu went away before slot %s was loaded", slot.c_str());
+        return;
+    }
+    if (!rd(menu + 0x98, &root) || !root) root = menu;           // the title's Continue: the menu's root, else the menu (0x16d4ae0)
+    ::Ctx* c = kernel::current_ctx();
+    if (!c) return;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         if (!has_save(slot)) {
             NXLOG_W(kTag, "Load: slot %s has no save any more; the title stays", slot.c_str());
-            return true;
+            return;
         }
+        set_active(slot);
     }
-    NXLOG_I(kTag, "Load: the title is up, slot %s is loaded as the title's Continue does", slot.c_str());
-    load_now(c, slot, root, seq);
-    return true;
+    static uint64_t yes[2];           // static: the game may keep the pointer past this call
+    yes[0] = 0;
+    yes[1] = root;
+    NXLOG_I(kTag, "Load: the title is up, slot %s is loaded by the title Continue prompt's own Yes", slot.c_str());
+    call(c, g_base + kPromptYes, {reinterpret_cast<uint64_t>(yes)});
 }
 // The slot becomes the one in use and the game is asked to load its Auto file (what the Continue prompt's Yes does).
 void load_now(::Ctx* c, const std::string& slot, uint64_t root, uint64_t seq) {
@@ -850,11 +871,11 @@ void saveslot_install(uint64_t base) {
 
 // Main thread, once per frame: hooks the entries once the game's data is there and is the build the addresses are for.
 constexpr uint64_t kGameMgr = 0x2231908, kGameCtx = 8, kGameCtxFlag = 0x10, kCtxSize = 0x170, kCtxLive = 0x11c;
-// [fefw] diag_ctx (issue #187, a test switch, default off): each time the set of live game-manager contexts (G + i*0x170 + 0x11c,
+// [fefw] diag_ctx (issue #187, a test switch, on while #187 is tested): each time the set of live game-manager contexts (G + i*0x170 + 0x11c,
 // i < 16), the context asked to end (G+8, G+0x10) or the main sequence's request (+0x98) changes, one line says so (at most 200 a run).
 // Compared between a session that loads from the title and one that loads from the + menu.
 void diag_ctx() {
-    static const bool on = config_get_bool("fefw", "diag_ctx", false);
+    static const bool on = config_get_bool("fefw", "diag_ctx", true);
     static int lines = 0;
     static std::string last;
     if (!on || lines >= 200 || !g_base) return;
@@ -887,6 +908,7 @@ void diag_ctx() {
 
 void saveslot_frame() {
     diag_ctx();
+    if (g_hooked) title_load_tick();
     if (g_hooked && g_tc_ok) title_continue_frame();
     if (g_hooked || g_failed || !g_on || !g_base) return;
     uint64_t probe = 0;
