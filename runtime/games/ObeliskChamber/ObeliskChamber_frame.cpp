@@ -417,7 +417,7 @@ uint32_t parse_skip(const std::string& list) {
 // The threshold is per frame, so at 60 fps the same clock speed moves half as far a frame and passes it only after the proc has ended:
 // no cry (at 120 a quarter). The callback is only ever called through its std::function, so it is wrapped through the function table
 // (no hook site needed): the step it reads is divided by s for the call (the 30 fps step for the same clock speed) and put back after.
-// [fefw] diag_voice logs each death's first wait and how it ended.
+// Checked on a PC at 120 fps: the cry is asked for at t = 0.968, as at 30. [fefw] diag_voice (off) logs each death's first wait and how it ended.
 constexpr uint32_t kDieCb = 0x1085350, kVoiceBusy = 0x100100, kUnitTableGot = 0x216b488;
 GuestFn g_die_cb_orig = nullptr;
 bool g_voice_log = false;
@@ -474,7 +474,7 @@ void die_cb_wrap(::Ctx* c) {
 // The lifted modules are registered after play mode installs its hooks: wrap the callback at the first frame step.
 void die_cb_try_install() {
     if (g_die_cb_tried.exchange(true)) return;
-    g_voice_log = config_get_bool("fefw", "diag_voice", true);
+    g_voice_log = config_get_bool("fefw", "diag_voice", false);
     const uint64_t at = st().base + kDieCb;
     g_die_cb_orig = fn_lookup(at);
     if (!g_die_cb_orig || !fn_lookup(st().base + kVoiceBusy)) {
