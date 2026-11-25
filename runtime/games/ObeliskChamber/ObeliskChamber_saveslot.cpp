@@ -639,6 +639,17 @@ void end_game_context() {
     }
     NXLOG_I(kTag, "Load: none of the contexts Return to Title ends (4, 6, 1) is live");
 }
+// [fefw] load_in_game (default on; issue #187): a load from the + menu asks the main sequence for the in-game load (request 35) instead of
+// the title's (32). The Continue prompt's Yes (0x16dd880) is written for the title: it asks for 32, which from inside a running game
+// left X unable to open the details box in Information and Roster until the game was closed (ending game contexts first did not help).
+// The game's own load from inside a game, the chapter's checkpoint (0x87eef0, reached from 0x1771130), sets the pending load
+// (0x87e8f0(4, 9, 0, 0): kind 4, file 9) and asks for 35. Here the pending load stays the slot's Auto file (2, -1, as the prompt's Yes
+// sets it) and only the request becomes 35.
+constexpr uint32_t kSeqLoadInGame = 35;
+bool load_in_game_on() {
+    static const bool on = config_get_bool("fefw", "load_in_game", true);
+    return on;
+}
 // The slot becomes the one in use and the game is asked to load its Auto file (what the Continue prompt's Yes does).
 void load_now(::Ctx* c, const std::string& slot, uint64_t root, uint64_t seq) {
     {
@@ -651,7 +662,7 @@ void load_now(::Ctx* c, const std::string& slot, uint64_t root, uint64_t seq) {
     end_game_context();
     call(c, g_base + kPendingLoad, {2, 0xffffffffull, 0});
     call(c, g_base + kProcEnd, {root});
-    wr<uint32_t>(seq + 0x98, kSeqLoad);
+    wr<uint32_t>(seq + 0x98, load_in_game_on() ? kSeqLoadInGame : kSeqLoad);
 }
 // A on a Load row without the game's prompt: once to arm it, again within a few seconds to load.
 uint32_t load_direct(::Ctx* c, int i, const std::string& slot) {
@@ -709,6 +720,16 @@ void prompt_yes(::Ctx* c) {
     }
     if (from_list) end_game_context();
     pass(c, g_base + kPromptYes);
+    if (from_list && load_in_game_on()) {
+        uint64_t seq = 0;
+        uint32_t state = 0;
+        if (rd(g_base + kMainSeq, &seq) && seq && rd(seq + 0x98, &state) && state == kSeqLoad) {
+            wr<uint32_t>(seq + 0x98, kSeqLoadInGame);
+            NXLOG_I(kTag, "Load: the main sequence is asked for the in-game load (35, as the chapter's checkpoint does) ([fefw] load_in_game)");
+        } else {
+            NXLOG_W(kTag, "Load: the main sequence's request is %u, not the title's load (32): left as it is", state);
+        }
+    }
     // On the world map the load the game just asked for waited until the slot list was closed by hand (seen on a PC): close it here.
     if (from_list) {
         const uint64_t answer = c->x[0];
