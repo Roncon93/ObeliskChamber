@@ -28,9 +28,11 @@ jobs:
           $v = Major
           Write-Output "installed clang-cl major version: $v"
           if ($v -lt 23) {
-            $exe = Join-Path $env:RUNNER_TEMP "LLVM-$want-win64.exe"
-            Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$want/LLVM-$want-win64.exe" -OutFile $exe
-            Start-Process -FilePath $exe -ArgumentList '/S' -Wait
+            # LLVM 23's Windows installer is an .msi (22 and older shipped an NSIS .exe)
+            $msi = Join-Path $env:RUNNER_TEMP "LLVM-$want-win64.msi"
+            Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$want/LLVM-$want-win64.msi" -OutFile $msi
+            $p = Start-Process -FilePath msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+            Write-Output "msiexec exit code: $($p.ExitCode)"
             $v = Major
           }
           & $cl --version
