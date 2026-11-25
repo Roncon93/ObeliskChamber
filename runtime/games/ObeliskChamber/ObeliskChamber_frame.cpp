@@ -35,8 +35,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -471,6 +474,63 @@ void die_cb_wrap(::Ctx* c) {
     if (!end) return;
     NXLOG_I(kTag, "voice: death cry, unit %u, t %.3f, unit clock step %.4f (the callback sees %.4f) -> %s%s", unit, t, step, seen, end, why.c_str());
 }
+// ---- [fefw] diag_facial (issue #205, a test switch, on while #205 is tested) ------------------------------------------------------------
+// Talk portraits at 60 fps show half of one expression over another (lids and brows of one, open eyes of the other); not from the
+// frame-rate fixes or smooth_step (checked on a PC). game::character::CharacterFacialController's update (vtable 0x20469b8 slot 5,
+// 0x10d1920; x0 = the controller, its owner at +8, the owner's clock at [owner + 496] + 16) eases its blends by time. It is only called
+// through its vtable, so it is wrapped through the function table and logs, per controller and at most four times a second, the clock
+// step and the controller's floats from +96 to +360 after the update, so a 30 and a 60 fps run of the same line can be compared.
+constexpr uint32_t kFacialUpdate = 0x10d1920;
+GuestFn g_facial_orig = nullptr;
+std::atomic<int> g_facial_lines{0};
+void facial_wrap(::Ctx* c) {
+    const uint64_t ctl = c->x[0];
+    g_facial_orig(c);
+    if (g_facial_lines.load(std::memory_order_relaxed) >= 3000) return;
+    struct Seen { uint64_t ctl; double at; };
+    static Seen seen[16] = {};   // main thread
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    Seen* slot = nullptr;
+    for (Seen& e : seen)
+        if (e.ctl == ctl) { slot = &e; break; }
+    if (!slot) {
+        slot = &seen[0];
+        for (Seen& e : seen)
+            if (e.at < slot->at) slot = &e;
+        slot->ctl = ctl, slot->at = 0;
+    }
+    if (now - slot->at < 0.25) return;
+    slot->at = now;
+    uint64_t owner = 0, clock = 0;
+    float step = -1.f;
+    if (vrd(ctl + 8, &owner) && vrd(owner + 496, &clock)) vrd(clock + 16, &step);
+    std::string vals;
+    for (uint32_t off = 96; off < 360; off += 4) {
+        float f = 0.f;
+        if (!vrd(ctl + off, &f)) break;
+        char b[24];
+        if (std::isfinite(f) && std::fabs(f) < 1e4f) std::snprintf(b, sizeof b, " %x:%.3g", off, f);
+        else std::snprintf(b, sizeof b, " %x:#%08x", off, std::bit_cast<uint32_t>(f));
+        vals += b;
+    }
+    g_facial_lines.fetch_add(1, std::memory_order_relaxed);
+    NXLOG_I(kTag, "facial: ctl %llx owner %llx step %.3f |%s", static_cast<unsigned long long>(ctl), static_cast<unsigned long long>(owner), step,
+            vals.c_str());
+}
+void facial_try_install() {
+    static std::atomic<bool> tried{false};
+    if (tried.exchange(true)) return;
+    if (!config_get_bool("fefw", "diag_facial", true)) return;
+    const uint64_t at = st().base + kFacialUpdate;
+    g_facial_orig = fn_lookup(at);
+    if (!g_facial_orig) {
+        NXLOG_W(kTag, "facial: [fefw] diag_facial: the facial controller update (0x%x) is not in this build", kFacialUpdate);
+        return;
+    }
+    fn_register(at, &facial_wrap);
+    NXLOG_I(kTag, "facial: facial controller logging on ([fefw] diag_facial, issue #205)");
+}
+
 // The lifted modules are registered after play mode installs its hooks: wrap the callback at the first frame step.
 void die_cb_try_install() {
     if (g_die_cb_tried.exchange(true)) return;
@@ -527,6 +587,7 @@ void frame_step(float step, int target) {
     State& s = st();
     if (!s.installed || target <= 0) return;
     die_cb_try_install();
+    facial_try_install();
     int native = s.native.load(std::memory_order_relaxed);
     if (native <= 0) native = target;
     const float sc = std::clamp(static_cast<float>(native) / static_cast<float>(target), 0.125f, 1.0f);
