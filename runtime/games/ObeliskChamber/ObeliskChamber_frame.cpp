@@ -630,11 +630,72 @@ void anim_move_wrap(::Ctx* c) {
     v.swap(next);
     if (n) g_hold_count.fetch_add(n, std::memory_order_relaxed);
 }
+// ---- [fefw] spine_lock (issue #205, a test switch) --------------------------------------------------------------------------------------
+// The talk portraits are Spine skeletons (spine-cpp; the game's wrapper 0x1947dd0). Each one is posed at its skeleton data's fps
+// (+0x358, from the skeleton data) from an accumulator of its own (+0x35c): it applies and advances one 1/30 s step whenever the
+// accumulator passes 1/30 s, and does nothing else between. At 30 fps every skeleton steps every frame, all together. At 60 each steps
+// every other frame, on whichever frame its own accumulator happens to pass 1/30 s: skeletons made on different frames (and drift: the
+// clock's 1/59.94 s steps are a little longer than half of 1/30 s) step on alternate frames, so the face and its eyes (a second skeleton
+// the face's blink event starts: talk::Seq::BindFaceEyeBlinkSync) are a frame apart through every blink and expression change.
+// The test: the manager that steps them (0x1940d60, called only through a pointer) gets its clock step ([+0x48] + 0x68, frames of
+// 1/59.94 s) as 0 on frames with no 30 Hz step in them and the frames since the last one on frames with one, so every skeleton steps
+// on the same frames, as at 30 fps. The clock's step is put back after the call.
+constexpr uint32_t kSpineManager = 0x1940d60;
+GuestFn g_spine_orig = nullptr;
+bool g_spine_lock = false;
+std::mutex g_spine_mu;
+std::unordered_map<uint64_t, float> g_spine_acc;   // manager -> clock frames held back since its last 30 Hz step; under g_spine_mu
+std::atomic<uint64_t> g_spine_held{0}, g_spine_steps{0};
+void spine_mgr_wrap(::Ctx* c) {
+    const uint64_t mgr = c->x[0];
+    uint64_t clock = 0;
+    float step = 0.f;
+    if (!g_spine_lock || full(scale(kAnim)) || !vrd(mgr + 0x48, &clock) || !vrd(clock + 0x68, &step) || !(step >= 0.f && step < 64.f)) {
+        g_spine_orig(c);
+        return;
+    }
+    float use = 0.f;
+    {
+        std::lock_guard<std::mutex> lk(g_spine_mu);
+        if (g_spine_acc.size() > 256) g_spine_acc.clear();
+        float& acc = g_spine_acc[mgr];
+        acc += step;
+        if (st().tick.load(std::memory_order_relaxed)) use = acc, acc = 0.f;
+    }
+    std::memcpy(reinterpret_cast<void*>(clock + 0x68), &use, 4);
+    g_spine_orig(c);
+    float now = 0.f;
+    if (vrd(clock + 0x68, &now) && now == use) std::memcpy(reinterpret_cast<void*>(clock + 0x68), &step, 4);
+    (use > 0.f ? g_spine_steps : g_spine_held).fetch_add(1, std::memory_order_relaxed);
+    count(kAnim);
+}
+void spine_try_install() {
+    static std::atomic<bool> tried{false};
+    if (tried.exchange(true)) return;
+    g_spine_lock = config_get_bool("fefw", "spine_lock", true);
+    if (!g_spine_lock) return;
+    const uint64_t at = st().base + kSpineManager;
+    if (!(g_spine_orig = fn_lookup(at))) {
+        NXLOG_W(kTag, "spine: [fefw] spine_lock: the Spine manager update (0x%x) is not in this build", kSpineManager);
+        g_spine_lock = false;
+        return;
+    }
+    fn_register(at, &spine_mgr_wrap);
+    NXLOG_I(kTag, "spine: [fefw] spine_lock on: the Spine skeletons (talk portraits) step together on the 30 Hz steps (issue #205)");
+}
+void spine_log() {   // from frame_step, every 10 s
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (!g_spine_lock || now - last < std::chrono::seconds(10)) return;
+    last = now;
+    NXLOG_I(kTag, "spine: manager calls in the last 10 s: %llu on a 30 Hz step, %llu held",
+            static_cast<unsigned long long>(g_spine_steps.exchange(0)), static_cast<unsigned long long>(g_spine_held.exchange(0)));
+}
 void facial_try_install() {
     static std::atomic<bool> tried{false};
     if (tried.exchange(true)) return;
     {
-        const std::string m = config_get_str("fefw", "face_anim_hold", "face");
+        const std::string m = config_get_str("fefw", "face_anim_hold", "off");
         g_hold_mode = m == "all" ? 2 : m == "off" ? 0 : 1;
         if (m != "all" && m != "off" && m != "face") NXLOG_W(kTag, "[fefw] face_anim_hold = %s: not off, face or all, face is used", m.c_str());
         const uint64_t at = st().base + kAnimCtrlMove;
@@ -647,7 +708,7 @@ void facial_try_install() {
             g_hold_mode = 0;
         }
     }
-    g_facial_log = config_get_bool("fefw", "diag_facial", true);
+    g_facial_log = config_get_bool("fefw", "diag_facial", false);
     if (!g_facial_log && g_hold_mode != 1) return;
     const uint64_t at = st().base + kFacialUpdate;
     g_facial_orig = fn_lookup(at);
@@ -716,6 +777,8 @@ void frame_step(float step, int target) {
     if (!s.installed || target <= 0) return;
     die_cb_try_install();
     facial_try_install();
+    spine_try_install();
+    spine_log();
     int native = s.native.load(std::memory_order_relaxed);
     if (native <= 0) native = target;
     const float sc = std::clamp(static_cast<float>(native) / static_cast<float>(target), 0.125f, 1.0f);
